@@ -6,6 +6,7 @@ import android.os.Build
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.kevinluo.autoglm.agent.AgentConfig
+import com.kevinluo.autoglm.task.RepeatTaskConfig
 import com.kevinluo.autoglm.model.ModelConfig
 import com.kevinluo.autoglm.util.Logger
 import org.json.JSONArray
@@ -98,6 +99,11 @@ class SettingsManager private constructor(private val context: Context) {
 
         // Task templates keys
         private const val KEY_TASK_TEMPLATES = "task_templates"
+
+        // Repeat task keys
+        private const val KEY_REPEAT_ENABLED = "task_repeat_enabled"
+        private const val KEY_REPEAT_MIN_MINUTES = "task_repeat_min_minutes"
+        private const val KEY_REPEAT_MAX_MINUTES = "task_repeat_max_minutes"
 
         // Custom system prompt keys
         private const val KEY_CUSTOM_SYSTEM_PROMPT_CN = "custom_system_prompt_cn"
@@ -311,6 +317,46 @@ class SettingsManager private constructor(private val context: Context) {
         lastAgentConfig = currentAgentConfig
 
         return changed
+    }
+
+    // ==================== Repeat Task Configuration ====================
+
+    /**
+     * Loads the repeat-task configuration used by the home task screen.
+     */
+    fun getRepeatTaskConfig(): RepeatTaskConfig =
+        RepeatTaskConfig(
+            enabled = prefs.getBoolean(KEY_REPEAT_ENABLED, false),
+            minMinutes =
+            prefs.getInt(
+                KEY_REPEAT_MIN_MINUTES,
+                RepeatTaskConfig.DEFAULT_MIN_MINUTES,
+            ),
+            maxMinutes =
+            prefs.getInt(
+                KEY_REPEAT_MAX_MINUTES,
+                RepeatTaskConfig.DEFAULT_MAX_MINUTES,
+            ),
+        ).let { config ->
+            if (config.isValid()) {
+                config
+            } else {
+                Logger.w(TAG, "Stored repeat task config is invalid, falling back to defaults")
+                RepeatTaskConfig()
+            }
+        }
+
+    /**
+     * Saves a validated repeat-task configuration.
+     */
+    fun saveRepeatTaskConfig(config: RepeatTaskConfig) {
+        require(config.isValid()) { "Repeat task configuration is invalid: $config" }
+
+        prefs.edit()
+            .putBoolean(KEY_REPEAT_ENABLED, config.enabled)
+            .putInt(KEY_REPEAT_MIN_MINUTES, config.minMinutes)
+            .putInt(KEY_REPEAT_MAX_MINUTES, config.maxMinutes)
+            .apply()
     }
 
     // ==================== Saved Model Profiles ====================
