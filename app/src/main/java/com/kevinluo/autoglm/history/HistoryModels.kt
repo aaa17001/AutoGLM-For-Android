@@ -1,6 +1,7 @@
 package com.kevinluo.autoglm.history
 
 import com.kevinluo.autoglm.action.AgentAction
+import com.kevinluo.autoglm.task.RepeatTaskConfig
 import java.util.UUID
 
 /**
@@ -22,6 +23,7 @@ import java.util.UUID
  */
 data class HistoryStep(
     val stepNumber: Int,
+    val roundNumber: Int = 1,
     val timestamp: Long = System.currentTimeMillis(),
     val thinking: String,
     val action: AgentAction?,
@@ -49,20 +51,39 @@ data class HistoryStep(
  */
 data class TaskHistory(
     val id: String = UUID.randomUUID().toString(),
+    val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
     val taskDescription: String,
     val startTime: Long = System.currentTimeMillis(),
     var endTime: Long? = null,
     var success: Boolean = false,
     var completionMessage: String? = null,
+    val repeatConfig: RepeatTaskConfig? = null,
     val steps: MutableList<HistoryStep> = mutableListOf(),
+    val events: MutableList<HistoryEvent> = mutableListOf(),
 ) {
     /** Duration of the task in milliseconds. */
     val duration: Long
         get() = (endTime ?: System.currentTimeMillis()) - startTime
 
-    /** Number of steps recorded in this task. */
+    /** Number of Agent steps recorded across all rounds. */
     val stepCount: Int
         get() = steps.size
+
+    /** Highest round number observed in steps or timeline events. */
+    val roundCount: Int
+        get() {
+            val stepRound = steps.maxOfOrNull { it.roundNumber } ?: 0
+            val eventRound = events.maxOfOrNull { it.roundNumber } ?: 0
+            return maxOf(stepRound, eventRound)
+        }
+
+    /** Number of user instructions added while the task was running. */
+    val instructionCount: Int
+        get() = events.count { it is HistoryEvent.UserInstructionAdded }
+
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 2
+    }
 }
 
 /**
