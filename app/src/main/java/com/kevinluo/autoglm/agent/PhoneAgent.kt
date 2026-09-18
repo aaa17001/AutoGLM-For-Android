@@ -401,23 +401,15 @@ class PhoneAgent(
                 }
 
                 if (stepResult.finished) {
-                    // A queued follow-up stage is complete when its Finish is reached. Any
-                    // instruction accepted concurrently with this Finish is resolved atomically
-                    // below before the round is allowed to close.
-                    activeQueuedInstruction?.let { instruction ->
-                        instructionSource?.markNextStepCompleted(
-                            instructionId = instruction.id,
-                            completedAtStep = currentStepNumber,
-                        )
-                        activeQueuedInstruction = null
-                    }
-
                     if (instructionSource != null) {
                         when (
                             val resolution =
                                 instructionSource.resolveRoundFinish(currentStepNumber + 1)
                         ) {
                             is RoundFinishResolution.ApplyImmediate -> {
+                                // A correction accepted before the atomic close belongs to the
+                                // stage that just attempted to Finish. Do not mark an active
+                                // queued stage complete until that correction also reaches Finish.
                                 pendingRuntimeDirective =
                                     buildImmediateInstructionDirective(resolution.instructions)
                                 nextStepHint = null
@@ -431,6 +423,15 @@ class PhoneAgent(
                             }
 
                             is RoundFinishResolution.ExecuteNext -> {
+                                // No correction is pending for the finishing stage, so it is now
+                                // safe to mark that stage complete before switching to the next one.
+                                activeQueuedInstruction?.let { instruction ->
+                                    instructionSource.markNextStepCompleted(
+                                        instructionId = instruction.id,
+                                        completedAtStep = currentStepNumber,
+                                    )
+                                }
+
                                 activeQueuedInstruction = resolution.instruction
                                 pendingRuntimeDirective =
                                     buildNextStepInstructionDirective(resolution.instruction)
@@ -444,7 +445,15 @@ class PhoneAgent(
                                 continue
                             }
 
-                            RoundFinishResolution.Finish -> Unit
+                            RoundFinishResolution.Finish -> {
+                                activeQueuedInstruction?.let { instruction ->
+                                    instructionSource.markNextStepCompleted(
+                                        instructionId = instruction.id,
+                                        completedAtStep = currentStepNumber,
+                                    )
+                                }
+                                activeQueuedInstruction = null
+                            }
                         }
                     }
 
