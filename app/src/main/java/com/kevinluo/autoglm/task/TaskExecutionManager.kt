@@ -367,10 +367,9 @@ object TaskExecutionManager :
                     instructionQueue.add(queued)
                     _runtimeInstructions.value = _runtimeInstructions.value + queued
                     updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionAdded(queued)
                 }
             }
-
-        getHistoryManager()?.recordInstructionAdded(instruction)
 
         Logger.i(
             TAG,
@@ -488,14 +487,14 @@ object TaskExecutionManager :
                         appliedAtStep = applyAtStep,
                     )
                 }.also { updated ->
-                    updated.forEach(::replaceInstructionLocked)
+                    updated.forEach { instruction ->
+                        replaceInstructionLocked(instruction)
+                        getHistoryManager()?.recordInstructionApplied(instruction)
+                    }
                     updateInstructionCountsLocked()
                 }
             }
 
-        applied.forEach { instruction ->
-            getHistoryManager()?.recordInstructionApplied(instruction)
-        }
         return applied
     }
 
@@ -509,10 +508,10 @@ object TaskExecutionManager :
                 ).also { updated ->
                     replaceInstructionLocked(updated)
                     updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionApplied(updated)
                 }
             }
 
-        getHistoryManager()?.recordInstructionApplied(executing)
         return executing
     }
 
@@ -532,10 +531,9 @@ object TaskExecutionManager :
                 ).also { updated ->
                     replaceInstructionLocked(updated)
                     updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionCompleted(updated)
                 }
             }
-
-        getHistoryManager()?.recordInstructionCompleted(completed)
     }
 
     override fun resolveRoundFinish(applyAtStep: Int): RoundFinishResolution {
@@ -550,7 +548,10 @@ object TaskExecutionManager :
                                 appliedAtStep = applyAtStep,
                             )
                         }
-                    applied.forEach(::replaceInstructionLocked)
+                    applied.forEach { instruction ->
+                        replaceInstructionLocked(instruction)
+                        getHistoryManager()?.recordInstructionApplied(instruction)
+                    }
                     updateInstructionCountsLocked()
                     return@synchronized RoundFinishResolution.ApplyImmediate(applied)
                 }
@@ -564,6 +565,7 @@ object TaskExecutionManager :
                         )
                     replaceInstructionLocked(executing)
                     updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionApplied(executing)
                     return@synchronized RoundFinishResolution.ExecuteNext(executing)
                 }
 
@@ -572,18 +574,6 @@ object TaskExecutionManager :
                 roundAcceptingInstructions = false
                 RoundFinishResolution.Finish
             }
-
-        when (resolution) {
-            is RoundFinishResolution.ApplyImmediate ->
-                resolution.instructions.forEach { instruction ->
-                    getHistoryManager()?.recordInstructionApplied(instruction)
-                }
-
-            is RoundFinishResolution.ExecuteNext ->
-                getHistoryManager()?.recordInstructionApplied(resolution.instruction)
-
-            RoundFinishResolution.Finish -> Unit
-        }
 
         return resolution
     }
