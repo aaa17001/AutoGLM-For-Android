@@ -11,6 +11,7 @@ import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import com.google.android.material.button.MaterialButton
 import com.kevinluo.autoglm.R
+import com.kevinluo.autoglm.task.RuntimeInstructionMode
 import com.kevinluo.autoglm.util.Logger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,39 +23,28 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * RecyclerView adapter for history detail with header and steps.
- *
- * Uses view type to handle header and step items differently.
- * Efficiently loads screenshots asynchronously and caches them for smooth scrolling.
- *
- * @param historyManager Manager for loading screenshots
- * @param coroutineScope Scope for launching async operations
- *
+ * RecyclerView adapter for the complete task-history timeline.
  */
-class HistoryDetailAdapter(private val historyManager: HistoryManager, private val coroutineScope: CoroutineScope) :
-    RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+class HistoryDetailAdapter(
+    private val historyManager: HistoryManager,
+    private val coroutineScope: CoroutineScope,
+) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
     private var task: TaskHistory? = null
+    private var timelineItems: List<HistoryTimelineItem> = emptyList()
     private val loadedBitmaps = mutableMapOf<String, Bitmap>()
     private val loadingJobs = mutableMapOf<Int, Job>()
-
     private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
 
-    /**
-     * Sets the task to display.
-     *
-     * @param task Task history to display
-     */
     fun setTask(task: TaskHistory) {
         this.task = task
-        Logger.d(TAG, "Set task with ${task.stepCount} steps")
+        timelineItems = buildHistoryTimeline(task)
+        Logger.d(
+            TAG,
+            "Set task with ${task.stepCount} steps, ${task.instructionCount} runtime instructions",
+        )
         notifyDataSetChanged()
     }
 
-    /**
-     * Cleans up resources including cached bitmaps and pending jobs.
-     *
-     * Should be called when the adapter is no longer needed.
-     */
     fun cleanup() {
         loadingJobs.values.forEach { it.cancel() }
         loadingJobs.clear()
@@ -63,66 +53,71 @@ class HistoryDetailAdapter(private val historyManager: HistoryManager, private v
         Logger.d(TAG, "Cleaned up adapter resources")
     }
 
-    override fun getItemViewType(position: Int): Int = if (position == 0) TYPE_HEADER else TYPE_STEP
+    override fun getItemViewType(position: Int): Int =
+        when (timelineItems[position]) {
+            is HistoryTimelineItem.Header -> TYPE_HEADER
+            is HistoryTimelineItem.AgentStepItem -> TYPE_STEP
+            else -> TYPE_EVENT
+        }
 
-    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+    override fun onCreateViewHolder(
+        parent: ViewGroup,
+        viewType: Int,
+    ): RecyclerView.ViewHolder {
         val inflater = LayoutInflater.from(parent.context)
         return when (viewType) {
-            TYPE_HEADER -> {
-                val view = inflater.inflate(R.layout.item_history_header, parent, false)
-                HeaderViewHolder(view)
-            }
+            TYPE_HEADER ->
+                HeaderViewHolder(
+                    inflater.inflate(R.layout.item_history_header, parent, false),
+                )
 
-            else -> {
-                val view = inflater.inflate(R.layout.item_history_step, parent, false)
-                StepViewHolder(view)
-            }
+            TYPE_STEP ->
+                StepViewHolder(
+                    inflater.inflate(R.layout.item_history_step, parent, false),
+                )
+
+            else ->
+                EventViewHolder(
+                    inflater.inflate(R.layout.item_history_event, parent, false),
+                )
         }
     }
 
-    override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-        val currentTask = task ?: return
-        when (holder) {
-            is HeaderViewHolder -> {
-                holder.bind(currentTask)
-            }
+    override fun onBindViewHolder(
+        holder: RecyclerView.ViewHolder,
+        position: Int,
+    ) {
+        when (val item = timelineItems[position]) {
+            is HistoryTimelineItem.Header ->
+                (holder as HeaderViewHolder).bind(item.task)
 
-            is StepViewHolder -> {
-                val stepIndex = position - 1 // Subtract 1 for header
-                if (stepIndex < currentTask.steps.size) {
-                    holder.bind(currentTask.steps[stepIndex])
-                }
-            }
+            is HistoryTimelineItem.AgentStepItem ->
+                (holder as StepViewHolder).bind(item.step)
+
+            else ->
+                (holder as EventViewHolder).bind(item)
         }
     }
 
-    override fun getItemCount(): Int {
-        val currentTask = task ?: return 0
-        return 1 + currentTask.steps.size // 1 header + steps
-    }
+    override fun getItemCount(): Int = timelineItems.size
 
     override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
         super.onViewRecycled(holder)
         if (holder is StepViewHolder) {
-            loadingJobs[holder.adapterPosition]?.cancel()
-            loadingJobs.remove(holder.adapterPosition)
+            val position = holder.bindingAdapterPosition
+            if (position != RecyclerView.NO_POSITION) {
+                loadingJobs[position]?.cancel()
+                loadingJobs.remove(position)
+            }
             holder.clearImage()
         }
     }
 
-    /**
-     * ViewHolder for the header section displaying task overview.
-     */
     inner class HeaderViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val taskDescription: TextView = itemView.findViewById(R.id.taskDescription)
         private val statusText: TextView = itemView.findViewById(R.id.statusText)
         private val infoText: TextView = itemView.findViewById(R.id.infoText)
 
-        /**
-         * Binds task data to the header view.
-         *
-         * @param task Task history to display
-         */
         fun bind(task: TaskHistory) {
             taskDescription.text = task.taskDescription
 
@@ -135,31 +130,113 @@ class HistoryDetailAdapter(private val historyManager: HistoryManager, private v
                 statusText.setTextColor(ContextCompat.getColor(context, R.color.status_error))
             }
 
-            val duration = formatDuration(task.duration)
-            infoText.text = "${dateFormat.format(Date(task.startTime))} · ${task.stepCount}步 · $duration"
+            infoText.text =
+                context.getString(
+                    R.string.history_info_extended_format,
+                    dateFormat.format(Date(task.startTime)),
+                    task.roundCount.coerceAtLeast(1),
+                    task.stepCount,
+                    task.instructionCount,
+                    formatDuration(task.duration),
+                )
         }
+    }
 
-        /**
-         * Formats duration in milliseconds to a human-readable string.
-         *
-         * @param ms Duration in milliseconds
-         * @return Formatted duration string
-         */
-        private fun formatDuration(ms: Long): String {
-            val seconds = ms / 1000
-            return when {
-                seconds < 60 -> "${seconds}秒"
-                seconds < 3600 -> "${seconds / 60}分${seconds % 60}秒"
-                else -> "${seconds / 3600}时${(seconds % 3600) / 60}分"
+    inner class EventViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
+        private val title: TextView = itemView.findViewById(R.id.eventTitle)
+        private val meta: TextView = itemView.findViewById(R.id.eventMeta)
+        private val content: TextView = itemView.findViewById(R.id.eventContent)
+
+        fun bind(item: HistoryTimelineItem) {
+            val context = itemView.context
+            meta.visibility = View.GONE
+            content.visibility = View.GONE
+            meta.text = ""
+            content.text = ""
+
+            when (item) {
+                is HistoryTimelineItem.RoundHeader -> {
+                    title.text =
+                        context.getString(
+                            R.string.history_round_format,
+                            item.roundNumber,
+                        )
+                    meta.visibility = View.VISIBLE
+                    meta.text = dateFormat.format(Date(item.timestamp))
+                }
+
+                is HistoryTimelineItem.UserInstructionItem -> {
+                    title.text =
+                        if (item.event.mode == RuntimeInstructionMode.CONTINUE_CURRENT) {
+                            context.getString(R.string.history_instruction_continue)
+                        } else {
+                            context.getString(R.string.history_instruction_next_step)
+                        }
+
+                    val metadata = mutableListOf<String>()
+                    metadata += dateFormat.format(Date(item.event.timestamp))
+                    metadata +=
+                        context.getString(
+                            R.string.history_added_at_step,
+                            item.event.addedAtStep,
+                        )
+                    item.appliedAtStep?.let {
+                        metadata += context.getString(R.string.history_applied_at_step, it)
+                    }
+                    item.completedAtStep?.let {
+                        metadata += context.getString(R.string.history_completed_at_step, it)
+                    }
+
+                    meta.visibility = View.VISIBLE
+                    meta.text = metadata.joinToString(" · ")
+                    content.visibility = View.VISIBLE
+                    content.text = item.event.content
+                }
+
+                is HistoryTimelineItem.RoundCompletedItem -> {
+                    title.text =
+                        context.getString(
+                            R.string.history_round_completed_format,
+                            item.event.roundNumber,
+                        )
+                    meta.visibility = View.VISIBLE
+                    meta.text = dateFormat.format(Date(item.event.timestamp))
+                    content.visibility = View.VISIBLE
+                    content.text =
+                        buildString {
+                            append(
+                                if (item.event.success) {
+                                    context.getString(R.string.history_success)
+                                } else {
+                                    context.getString(R.string.history_failed)
+                                },
+                            )
+                            item.event.message?.takeIf { it.isNotBlank() }?.let {
+                                append(" · ")
+                                append(it)
+                            }
+                        }
+                }
+
+                is HistoryTimelineItem.RepeatScheduledItem -> {
+                    title.text = context.getString(R.string.history_repeat_wait)
+                    meta.visibility = View.VISIBLE
+                    meta.text = dateFormat.format(Date(item.event.timestamp))
+                    content.visibility = View.VISIBLE
+                    content.text =
+                        context.getString(
+                            R.string.history_repeat_wait_detail_format,
+                            item.event.delaySeconds,
+                            formatSeconds(item.event.delaySeconds),
+                        )
+                }
+
+                is HistoryTimelineItem.Header,
+                is HistoryTimelineItem.AgentStepItem -> Unit
             }
         }
     }
 
-    /**
-     * ViewHolder for individual step items.
-     *
-     * Displays step number, action description, thinking, screenshot, and status.
-     */
     inner class StepViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
         private val stepNumber: TextView = itemView.findViewById(R.id.stepNumber)
         private val actionDescription: TextView = itemView.findViewById(R.id.actionDescription)
@@ -174,14 +251,8 @@ class HistoryDetailAdapter(private val historyManager: HistoryManager, private v
 
         private var currentStep: HistoryStep? = null
 
-        /**
-         * Binds step data to the view.
-         *
-         * @param step History step to display
-         */
         fun bind(step: HistoryStep) {
             currentStep = step
-
             stepNumber.text = step.stepNumber.toString()
             actionDescription.text = step.actionDescription
 
@@ -241,22 +312,14 @@ class HistoryDetailAdapter(private val historyManager: HistoryManager, private v
             }
         }
 
-        /**
-         * Clears the screenshot image to free memory.
-         */
         fun clearImage() {
             screenshotImage.setImageDrawable(null)
         }
 
-        /**
-         * Loads a screenshot asynchronously and displays it.
-         *
-         * Uses caching to avoid reloading already-loaded images.
-         *
-         * @param path File path to the screenshot
-         * @param imageView ImageView to display the screenshot in
-         */
-        private fun loadScreenshot(path: String?, imageView: ImageView) {
+        private fun loadScreenshot(
+            path: String?,
+            imageView: ImageView,
+        ) {
             if (path == null) return
 
             loadedBitmaps[path]?.let {
@@ -266,27 +329,45 @@ class HistoryDetailAdapter(private val historyManager: HistoryManager, private v
                 }
             }
 
-            loadingJobs[adapterPosition]?.cancel()
-
-            loadingJobs[adapterPosition] =
-                coroutineScope.launch {
-                    val bitmap =
-                        withContext(Dispatchers.IO) {
-                            historyManager.getScreenshotBitmap(path)
-                        }
-                    bitmap?.let {
-                        loadedBitmaps[path] = it
-                        if (currentStep?.screenshotPath == path || currentStep?.annotatedScreenshotPath == path) {
-                            imageView.setImageBitmap(it)
+            val position = bindingAdapterPosition
+            if (position != RecyclerView.NO_POSITION) {
+                loadingJobs[position]?.cancel()
+                loadingJobs[position] =
+                    coroutineScope.launch {
+                        val bitmap =
+                            withContext(Dispatchers.IO) {
+                                historyManager.getScreenshotBitmap(path)
+                            }
+                        bitmap?.let {
+                            loadedBitmaps[path] = it
+                            if (
+                                currentStep?.screenshotPath == path ||
+                                currentStep?.annotatedScreenshotPath == path
+                            ) {
+                                imageView.setImageBitmap(it)
+                            }
                         }
                     }
-                }
+            }
         }
     }
+
+    private fun formatDuration(ms: Long): String {
+        val seconds = ms / 1000L
+        return formatSeconds(seconds)
+    }
+
+    private fun formatSeconds(seconds: Long): String =
+        when {
+            seconds < 60L -> "${seconds}秒"
+            seconds < 3600L -> "${seconds / 60L}分${seconds % 60L}秒"
+            else -> "${seconds / 3600L}时${(seconds % 3600L) / 60L}分"
+        }
 
     companion object {
         private const val TAG = "HistoryDetailAdapter"
         private const val TYPE_HEADER = 0
         private const val TYPE_STEP = 1
+        private const val TYPE_EVENT = 2
     }
 }

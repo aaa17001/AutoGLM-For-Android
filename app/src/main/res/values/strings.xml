@@ -264,6 +264,24 @@
     <string name="history_save_failed">保存失败</string>
     <string name="history_copy_prompt">复制提示词</string>
     <string name="history_prompt_copied">提示词已复制到剪贴板</string>
+    <string name="history_info_extended_format">%1$s · %2$d轮 · %3$d步 · 追加%4$d次 · %5$s</string>
+    <string name="history_round_format">第 %1$d 轮</string>
+    <string name="history_instruction_continue">用户追加 · 继续当前任务</string>
+    <string name="history_instruction_next_step">用户追加 · 下一步</string>
+    <string name="history_added_at_step">添加于 Step %1$d</string>
+    <string name="history_applied_at_step">生效于 Step %1$d</string>
+    <string name="history_completed_at_step">完成于 Step %1$d</string>
+    <string name="history_round_completed_format">第 %1$d 轮完成</string>
+    <string name="history_repeat_wait">下一轮等待</string>
+    <string name="history_repeat_wait_detail_format">随机等待 %1$d 秒（%2$s）</string>
+    <string name="history_export_title">导出完整记录</string>
+    <string name="history_export_markdown">Markdown（便于人和 AI 阅读）</string>
+    <string name="history_export_json">JSON（完整结构化数据）</string>
+    <string name="history_export_zip">完整 ZIP（记录 + 全部截图）</string>
+    <string name="history_export_generating">正在生成完整任务记录…</string>
+    <string name="history_export_ready">任务记录已生成</string>
+    <string name="history_export_failed">导出任务记录失败</string>
+    <string name="history_export_share_title">导出 AutoGLM 任务记录</string>
     <string name="history_load_more">加载更多</string>
     <string name="history_load_more_count">加载更多 (剩余 %d 步)</string>
     
