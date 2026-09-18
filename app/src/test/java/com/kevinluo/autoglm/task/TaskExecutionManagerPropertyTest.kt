@@ -152,6 +152,12 @@ class TaskExecutionStatePropertyTest :
             state.currentAction shouldBe ""
             state.resultMessage shouldBe ""
             state.taskDescription shouldBe ""
+            state.roundNumber shouldBe 0
+            state.repeatEnabled shouldBe false
+            state.repeatRemainingSeconds shouldBe 0L
+            state.nextRunAtMillis shouldBe null
+            state.pendingInstructionCount shouldBe 0
+            state.queuedNextStepCount shouldBe 0
         }
 
         /**
@@ -172,6 +178,12 @@ class TaskExecutionStatePropertyTest :
                         currentAction = "test action",
                         resultMessage = "test result",
                         taskDescription = "test description",
+                        roundNumber = 3,
+                        repeatEnabled = true,
+                        repeatRemainingSeconds = 437L,
+                        nextRunAtMillis = 123456789L,
+                        pendingInstructionCount = 2,
+                        queuedNextStepCount = 4,
                     )
 
                 val copied = original.copy(status = newStatus)
@@ -182,6 +194,12 @@ class TaskExecutionStatePropertyTest :
                 copied.currentAction shouldBe original.currentAction
                 copied.resultMessage shouldBe original.resultMessage
                 copied.taskDescription shouldBe original.taskDescription
+                copied.roundNumber shouldBe original.roundNumber
+                copied.repeatEnabled shouldBe original.repeatEnabled
+                copied.repeatRemainingSeconds shouldBe original.repeatRemainingSeconds
+                copied.nextRunAtMillis shouldBe original.nextRunAtMillis
+                copied.pendingInstructionCount shouldBe original.pendingInstructionCount
+                copied.queuedNextStepCount shouldBe original.queuedNextStepCount
             }
         }
     })

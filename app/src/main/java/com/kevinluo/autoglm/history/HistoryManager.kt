@@ -6,6 +6,9 @@ import android.graphics.BitmapFactory
 import android.os.Build
 import android.util.Base64
 import com.kevinluo.autoglm.action.AgentAction
+import com.kevinluo.autoglm.task.RepeatTaskConfig
+import com.kevinluo.autoglm.task.RuntimeInstruction
+import com.kevinluo.autoglm.task.RuntimeInstructionMode
 import com.kevinluo.autoglm.util.Logger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -44,6 +47,15 @@ class HistoryManager private constructor(private val context: Context) {
     /** Currently recording task, null if no task is being recorded. */
     private var currentTask: TaskHistory? = null
 
+    /** Current repeat round. Legacy/non-repeat tasks use round 1. */
+    private var currentRoundNumber: Int = 1
+
+    /** Monotonic sequence used to preserve exact event ordering. */
+    private var eventSequence: Long = 0L
+
+    /** Protects event sequence assignment and timeline mutation. */
+    private val eventLock = Any()
+
     /** Base64-encoded screenshot data for the current step. */
     private var currentScreenshotBase64: String? = null
 
@@ -72,11 +84,120 @@ class HistoryManager private constructor(private val context: Context) {
      * @return The newly created [TaskHistory] instance
      *
      */
-    fun startTask(taskDescription: String): TaskHistory {
-        val task = TaskHistory(taskDescription = taskDescription)
-        currentTask = task
+    fun startTask(
+        taskDescription: String,
+        repeatConfig: RepeatTaskConfig? = null,
+    ): TaskHistory {
+        val task =
+            TaskHistory(
+                taskDescription = taskDescription,
+                repeatConfig = repeatConfig,
+            )
+        synchronized(eventLock) {
+            currentTask = task
+            currentRoundNumber = 1
+            eventSequence = 0L
+        }
         Logger.d(TAG, "Started recording task: ${task.id}")
         return task
+    }
+
+    /**
+     * Marks the beginning of a task round.
+     */
+    fun startRound(roundNumber: Int) {
+        require(roundNumber > 0) { "roundNumber must be greater than zero" }
+        currentRoundNumber = roundNumber
+        appendEvent { sequence ->
+            HistoryEvent.RoundStarted(
+                sequence = sequence,
+                roundNumber = roundNumber,
+            )
+        }
+    }
+
+    /**
+     * Records the completion of a task round without completing the whole task session.
+     */
+    fun completeRound(
+        roundNumber: Int,
+        success: Boolean,
+        message: String?,
+    ) {
+        appendEvent { sequence ->
+            HistoryEvent.RoundCompleted(
+                sequence = sequence,
+                roundNumber = roundNumber,
+                success = success,
+                message = message,
+            )
+        }
+    }
+
+    /**
+     * Records a runtime instruction at the moment the user adds it.
+     */
+    fun recordInstructionAdded(instruction: RuntimeInstruction) {
+        appendEvent { sequence ->
+            HistoryEvent.UserInstructionAdded(
+                sequence = sequence,
+                timestamp = instruction.createdAt,
+                roundNumber = instruction.roundNumber,
+                instructionId = instruction.id,
+                content = instruction.content,
+                mode = instruction.mode,
+                addedAtStep = instruction.addedAtStep,
+            )
+        }
+    }
+
+    /**
+     * Records the Agent step where a runtime instruction became active.
+     */
+    fun recordInstructionApplied(instruction: RuntimeInstruction) {
+        val appliedAtStep = instruction.appliedAtStep ?: return
+        appendEvent { sequence ->
+            HistoryEvent.UserInstructionApplied(
+                sequence = sequence,
+                roundNumber = instruction.roundNumber,
+                instructionId = instruction.id,
+                appliedAtStep = appliedAtStep,
+            )
+        }
+    }
+
+    /**
+     * Records the Agent step where a queued follow-up instruction completed.
+     */
+    fun recordInstructionCompleted(instruction: RuntimeInstruction) {
+        val completedAtStep = instruction.completedAtStep ?: return
+        appendEvent { sequence ->
+            HistoryEvent.UserInstructionCompleted(
+                sequence = sequence,
+                roundNumber = instruction.roundNumber,
+                instructionId = instruction.id,
+                completedAtStep = completedAtStep,
+            )
+        }
+    }
+
+    /**
+     * Records the randomized delay selected before the next repeat round.
+     */
+    fun recordRepeatScheduled(
+        roundNumber: Int,
+        delaySeconds: Long,
+        nextRunAtMillis: Long,
+    ) {
+        require(delaySeconds >= 0L) { "delaySeconds must not be negative" }
+        appendEvent { sequence ->
+            HistoryEvent.RepeatScheduled(
+                sequence = sequence,
+                roundNumber = roundNumber,
+                delaySeconds = delaySeconds,
+                nextRunAtMillis = nextRunAtMillis,
+            )
+        }
     }
 
     /**
@@ -131,7 +252,7 @@ class HistoryManager private constructor(private val context: Context) {
                 val webpBytes = Base64.decode(base64, Base64.DEFAULT)
 
                 // Save original screenshot directly without re-compression
-                screenshotPath = saveScreenshotBytes(task.id, stepNumber, webpBytes, false)
+                screenshotPath = saveScreenshotBytes(task.id, currentRoundNumber, stepNumber, webpBytes, false)
 
                 // Create and save annotated screenshot if action has visual annotation
                 if (action != null) {
@@ -151,7 +272,14 @@ class HistoryManager private constructor(private val context: Context) {
                             val scaleFactor = bitmap.width.toFloat() / context.resources.displayMetrics.widthPixels
                             val scaledDensity = baseDensity * scaleFactor
                             val annotatedBitmap = ScreenshotAnnotator.annotate(bitmap, annotation, scaledDensity)
-                            annotatedPath = saveScreenshotBitmap(task.id, stepNumber, annotatedBitmap, true)
+                            annotatedPath =
+                                saveScreenshotBitmap(
+                                    task.id,
+                                    currentRoundNumber,
+                                    stepNumber,
+                                    annotatedBitmap,
+                                    true,
+                                )
                             annotatedBitmap.recycle()
                             bitmap.recycle()
                         }
@@ -165,6 +293,7 @@ class HistoryManager private constructor(private val context: Context) {
         val step =
             HistoryStep(
                 stepNumber = stepNumber,
+                roundNumber = currentRoundNumber,
                 thinking = thinking,
                 action = action,
                 actionDescription = actionDescription,
@@ -175,6 +304,14 @@ class HistoryManager private constructor(private val context: Context) {
             )
 
         task.steps.add(step)
+        appendEvent { sequence ->
+            HistoryEvent.AgentStepRecorded(
+                sequence = sequence,
+                timestamp = step.timestamp,
+                roundNumber = step.roundNumber,
+                stepNumber = step.stepNumber,
+            )
+        }
         Logger.d(TAG, "Recorded step $stepNumber for task ${task.id}")
 
         // Clear current screenshot
@@ -198,7 +335,12 @@ class HistoryManager private constructor(private val context: Context) {
         // Don't save empty tasks (no steps recorded)
         if (task.steps.isEmpty()) {
             Logger.d(TAG, "Skipping empty task ${task.id}")
-            currentTask = null
+            synchronized(eventLock) {
+                currentTask = null
+                currentRoundNumber = 1
+                eventSequence = 0L
+            }
+            currentScreenshotBase64 = null
             return@withContext
         }
 
@@ -223,7 +365,11 @@ class HistoryManager private constructor(private val context: Context) {
         saveHistoryIndex()
 
         Logger.d(TAG, "Completed task ${task.id}, success=$success")
-        currentTask = null
+        synchronized(eventLock) {
+            currentTask = null
+            currentRoundNumber = 1
+            eventSequence = 0L
+        }
     }
 
     /**
@@ -310,13 +456,14 @@ class HistoryManager private constructor(private val context: Context) {
      */
     private fun saveScreenshotBytes(
         taskId: String,
+        roundNumber: Int,
         stepNumber: Int,
         webpBytes: ByteArray,
         annotated: Boolean,
     ): String {
-        val taskDir = File(historyDir, taskId).also { it.mkdirs() }
+        val roundDir = getRoundDirectory(taskId, roundNumber)
         val suffix = if (annotated) "_annotated" else ""
-        val file = File(taskDir, "step_${stepNumber}$suffix.webp")
+        val file = File(roundDir, "step_${stepNumber.toString().padStart(3, '0')}$suffix.webp")
 
         FileOutputStream(file).use { out ->
             out.write(webpBytes)
@@ -334,10 +481,16 @@ class HistoryManager private constructor(private val context: Context) {
      * @param annotated Whether this is an annotated screenshot
      * @return Absolute file path of the saved screenshot
      */
-    private fun saveScreenshotBitmap(taskId: String, stepNumber: Int, bitmap: Bitmap, annotated: Boolean): String {
-        val taskDir = File(historyDir, taskId).also { it.mkdirs() }
+    private fun saveScreenshotBitmap(
+        taskId: String,
+        roundNumber: Int,
+        stepNumber: Int,
+        bitmap: Bitmap,
+        annotated: Boolean,
+    ): String {
+        val roundDir = getRoundDirectory(taskId, roundNumber)
         val suffix = if (annotated) "_annotated" else ""
-        val file = File(taskDir, "step_${stepNumber}$suffix.webp")
+        val file = File(roundDir, "step_${stepNumber.toString().padStart(3, '0')}$suffix.webp")
 
         FileOutputStream(file).use { out ->
             @Suppress("DEPRECATION")
@@ -354,6 +507,28 @@ class HistoryManager private constructor(private val context: Context) {
     }
 
     /**
+     * Returns the directory used for screenshots belonging to one task round.
+     */
+    private fun getRoundDirectory(taskId: String, roundNumber: Int): File {
+        val taskDir = File(historyDir, taskId).also { it.mkdirs() }
+        return File(
+            taskDir,
+            "round_${roundNumber.toString().padStart(3, '0')}",
+        ).also { it.mkdirs() }
+    }
+
+    /**
+     * Appends an event with a strictly increasing sequence number.
+     */
+    private fun appendEvent(factory: (Long) -> HistoryEvent) {
+        synchronized(eventLock) {
+            val task = currentTask ?: return@synchronized
+            eventSequence += 1L
+            task.events.add(factory(eventSequence))
+        }
+    }
+
+    /**
      * Saves a task's metadata to JSON file.
      *
      * @param task Task history to save
@@ -364,33 +539,103 @@ class HistoryManager private constructor(private val context: Context) {
 
         val json =
             JSONObject().apply {
+                put("schemaVersion", task.schemaVersion)
                 put("id", task.id)
                 put("taskDescription", task.taskDescription)
                 put("startTime", task.startTime)
-                put("endTime", task.endTime)
+                put("endTime", task.endTime ?: JSONObject.NULL)
                 put("success", task.success)
-                put("completionMessage", task.completionMessage)
+                put("completionMessage", task.completionMessage ?: JSONObject.NULL)
+                put(
+                    "repeatConfig",
+                    task.repeatConfig?.let { repeatConfig ->
+                        JSONObject().apply {
+                            put("enabled", repeatConfig.enabled)
+                            put("minMinutes", repeatConfig.minMinutes)
+                            put("maxMinutes", repeatConfig.maxMinutes)
+                        }
+                    } ?: JSONObject.NULL,
+                )
 
                 val stepsArray = JSONArray()
                 task.steps.forEach { step ->
                     stepsArray.put(
                         JSONObject().apply {
+                            put("roundNumber", step.roundNumber)
                             put("stepNumber", step.stepNumber)
                             put("timestamp", step.timestamp)
                             put("thinking", step.thinking)
                             put("actionDescription", step.actionDescription)
-                            put("screenshotPath", step.screenshotPath)
-                            put("annotatedScreenshotPath", step.annotatedScreenshotPath)
+                            put("screenshotPath", step.screenshotPath ?: JSONObject.NULL)
+                            put("annotatedScreenshotPath", step.annotatedScreenshotPath ?: JSONObject.NULL)
                             put("success", step.success)
-                            put("message", step.message)
+                            put("message", step.message ?: JSONObject.NULL)
                         },
                     )
                 }
                 put("steps", stepsArray)
+
+                val eventsArray = JSONArray()
+                task.events
+                    .sortedBy { it.sequence }
+                    .forEach { event ->
+                        eventsArray.put(historyEventToJson(event))
+                    }
+                put("events", eventsArray)
             }
 
         metaFile.writeText(json.toString(2))
     }
+
+    private fun historyEventToJson(event: HistoryEvent): JSONObject =
+        JSONObject().apply {
+            put("sequence", event.sequence)
+            put("timestamp", event.timestamp)
+            put("roundNumber", event.roundNumber)
+
+            when (event) {
+                is HistoryEvent.RoundStarted -> {
+                    put("type", EVENT_ROUND_STARTED)
+                }
+
+                is HistoryEvent.AgentStepRecorded -> {
+                    put("type", EVENT_AGENT_STEP_RECORDED)
+                    put("stepNumber", event.stepNumber)
+                }
+
+                is HistoryEvent.UserInstructionAdded -> {
+                    put("type", EVENT_USER_INSTRUCTION_ADDED)
+                    put("instructionId", event.instructionId)
+                    put("content", event.content)
+                    put("mode", event.mode.name)
+                    put("addedAtStep", event.addedAtStep)
+                }
+
+                is HistoryEvent.UserInstructionApplied -> {
+                    put("type", EVENT_USER_INSTRUCTION_APPLIED)
+                    put("instructionId", event.instructionId)
+                    put("appliedAtStep", event.appliedAtStep)
+                }
+
+                is HistoryEvent.UserInstructionCompleted -> {
+                    put("type", EVENT_USER_INSTRUCTION_COMPLETED)
+                    put("instructionId", event.instructionId)
+                    put("completedAtStep", event.completedAtStep)
+                }
+
+                is HistoryEvent.RoundCompleted -> {
+                    put("type", EVENT_ROUND_COMPLETED)
+                    put("success", event.success)
+                    put("message", event.message ?: JSONObject.NULL)
+                }
+
+                is HistoryEvent.RepeatScheduled -> {
+                    put("type", EVENT_REPEAT_SCHEDULED)
+                    put("delaySeconds", event.delaySeconds)
+                    put("nextRunAtMillis", event.nextRunAtMillis)
+                }
+            }
+        }
 
     /**
      * Loads a task from its JSON metadata file.
@@ -404,7 +649,9 @@ class HistoryManager private constructor(private val context: Context) {
 
         return try {
             val json = JSONObject(metaFile.readText())
+            val schemaVersion = json.optInt("schemaVersion", 1)
             val steps = mutableListOf<HistoryStep>()
+            val events = mutableListOf<HistoryEvent>()
 
             val stepsArray = json.optJSONArray("steps")
             if (stepsArray != null) {
@@ -413,37 +660,152 @@ class HistoryManager private constructor(private val context: Context) {
                     steps.add(
                         HistoryStep(
                             stepNumber = stepJson.getInt("stepNumber"),
+                            roundNumber = stepJson.optInt("roundNumber", 1),
                             timestamp = stepJson.getLong("timestamp"),
                             thinking = stepJson.getString("thinking"),
                             // Action is not serialized
                             action = null,
                             actionDescription = stepJson.getString("actionDescription"),
-                            screenshotPath = stepJson.optString("screenshotPath").takeIf { it.isNotEmpty() },
-                            annotatedScreenshotPath =
-                            stepJson
-                                .optString("annotatedScreenshotPath")
-                                .takeIf { it.isNotEmpty() },
+                            screenshotPath = stepJson.optNullableString("screenshotPath"),
+                            annotatedScreenshotPath = stepJson.optNullableString("annotatedScreenshotPath"),
                             success = stepJson.getBoolean("success"),
-                            message = stepJson.optString("message").takeIf { it.isNotEmpty() },
+                            message = stepJson.optNullableString("message"),
                         ),
                     )
                 }
             }
 
+            val eventsArray = json.optJSONArray("events")
+            if (eventsArray != null) {
+                for (i in 0 until eventsArray.length()) {
+                    historyEventFromJson(eventsArray.getJSONObject(i))?.let(events::add)
+                }
+            }
+
+            val repeatConfig =
+                json.optJSONObject("repeatConfig")?.let { repeatJson ->
+                    RepeatTaskConfig(
+                        enabled = repeatJson.optBoolean("enabled", false),
+                        minMinutes =
+                        repeatJson.optInt(
+                            "minMinutes",
+                            RepeatTaskConfig.DEFAULT_MIN_MINUTES,
+                        ),
+                        maxMinutes =
+                        repeatJson.optInt(
+                            "maxMinutes",
+                            RepeatTaskConfig.DEFAULT_MAX_MINUTES,
+                        ),
+                    ).takeIf { it.isValid() }
+                }
+
             TaskHistory(
                 id = json.getString("id"),
+                schemaVersion = schemaVersion,
                 taskDescription = json.getString("taskDescription"),
                 startTime = json.getLong("startTime"),
-                endTime = json.optLong("endTime"),
-                success = json.getBoolean("success"),
-                completionMessage = json.optString("completionMessage").takeIf { it.isNotEmpty() },
+                endTime =
+                if (json.has("endTime") && !json.isNull("endTime")) {
+                    json.getLong("endTime")
+                } else {
+                    null
+                },
+                success = json.optBoolean("success", false),
+                completionMessage = json.optNullableString("completionMessage"),
+                repeatConfig = repeatConfig,
                 steps = steps,
+                events = events,
             )
         } catch (e: Exception) {
             Logger.e(TAG, "Failed to load task $taskId", e)
             null
         }
     }
+
+    private fun historyEventFromJson(json: JSONObject): HistoryEvent? {
+        val sequence = json.optLong("sequence", 0L)
+        val timestamp = json.optLong("timestamp", 0L)
+        val roundNumber = json.optInt("roundNumber", 1)
+
+        return when (json.optString("type")) {
+            EVENT_ROUND_STARTED ->
+                HistoryEvent.RoundStarted(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                )
+
+            EVENT_AGENT_STEP_RECORDED ->
+                HistoryEvent.AgentStepRecorded(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    stepNumber = json.getInt("stepNumber"),
+                )
+
+            EVENT_USER_INSTRUCTION_ADDED -> {
+                val mode =
+                    runCatching {
+                        RuntimeInstructionMode.valueOf(json.getString("mode"))
+                    }.getOrNull() ?: return null
+
+                HistoryEvent.UserInstructionAdded(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    instructionId = json.getString("instructionId"),
+                    content = json.getString("content"),
+                    mode = mode,
+                    addedAtStep = json.getInt("addedAtStep"),
+                )
+            }
+
+            EVENT_USER_INSTRUCTION_APPLIED ->
+                HistoryEvent.UserInstructionApplied(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    instructionId = json.getString("instructionId"),
+                    appliedAtStep = json.getInt("appliedAtStep"),
+                )
+
+            EVENT_USER_INSTRUCTION_COMPLETED ->
+                HistoryEvent.UserInstructionCompleted(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    instructionId = json.getString("instructionId"),
+                    completedAtStep = json.getInt("completedAtStep"),
+                )
+
+            EVENT_ROUND_COMPLETED ->
+                HistoryEvent.RoundCompleted(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    success = json.optBoolean("success", false),
+                    message = json.optNullableString("message"),
+                )
+
+            EVENT_REPEAT_SCHEDULED ->
+                HistoryEvent.RepeatScheduled(
+                    sequence = sequence,
+                    timestamp = timestamp,
+                    roundNumber = roundNumber,
+                    delaySeconds = json.getLong("delaySeconds"),
+                    nextRunAtMillis = json.getLong("nextRunAtMillis"),
+                )
+
+            else -> null
+        }
+    }
+
+    private fun JSONObject.optNullableString(key: String): String? =
+        if (!has(key) || isNull(key)) {
+            null
+        } else {
+            optString(key).takeIf { it.isNotEmpty() }
+        }
 
     /**
      * Deletes all files associated with a task.
@@ -495,6 +857,14 @@ class HistoryManager private constructor(private val context: Context) {
         private const val HISTORY_DIR = "task_history"
         private const val INDEX_FILE = "history_index.json"
         private const val MAX_HISTORY_COUNT = 50
+
+        private const val EVENT_ROUND_STARTED = "round_started"
+        private const val EVENT_AGENT_STEP_RECORDED = "agent_step_recorded"
+        private const val EVENT_USER_INSTRUCTION_ADDED = "user_instruction_added"
+        private const val EVENT_USER_INSTRUCTION_APPLIED = "user_instruction_applied"
+        private const val EVENT_USER_INSTRUCTION_COMPLETED = "user_instruction_completed"
+        private const val EVENT_ROUND_COMPLETED = "round_completed"
+        private const val EVENT_REPEAT_SCHEDULED = "repeat_scheduled"
 
         @Volatile
         private var instance: HistoryManager? = null

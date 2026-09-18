@@ -108,18 +108,44 @@
 
                     </com.google.android.material.textfield.TextInputLayout>
 
-                    <!-- Start Task Button -->
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnStartTask"
+                    <!-- Start + repeat configuration -->
+                    <LinearLayout
                         android:layout_width="match_parent"
-                        android:layout_height="48dp"
+                        android:layout_height="wrap_content"
                         android:layout_marginTop="16dp"
-                        android:text="@string/start_task"
-                        app:backgroundTint="@color/primary"
-                        app:cornerRadius="12dp"
-                        app:icon="@drawable/ic_play"
-                        app:iconGravity="textStart"
-                        app:iconPadding="8dp" />
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnStartTask"
+                            android:layout_width="0dp"
+                            android:layout_height="48dp"
+                            android:layout_weight="1"
+                            android:text="@string/start_task"
+                            app:backgroundTint="@color/primary"
+                            app:cornerRadius="12dp"
+                            app:icon="@drawable/ic_play"
+                            app:iconGravity="textStart"
+                            app:iconPadding="8dp" />
+
+                        <Space
+                            android:layout_width="8dp"
+                            android:layout_height="1dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnRepeatConfig"
+                            android:layout_width="0dp"
+                            android:layout_height="48dp"
+                            android:layout_weight="1"
+                            android:text="@string/repeat_disabled"
+                            android:textColor="@color/primary"
+                            app:backgroundTint="@color/button_secondary"
+                            app:cornerRadius="12dp"
+                            app:icon="@drawable/ic_tune"
+                            app:iconGravity="textStart"
+                            app:iconTint="@color/primary"
+                            app:iconPadding="6dp" />
+
+                    </LinearLayout>
 
                 </LinearLayout>
 

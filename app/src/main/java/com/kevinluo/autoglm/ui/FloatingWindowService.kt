@@ -28,6 +28,9 @@ import com.kevinluo.autoglm.MainActivity
 import com.kevinluo.autoglm.R
 import com.kevinluo.autoglm.action.AgentAction
 import com.kevinluo.autoglm.screenshot.FloatingWindowController
+import com.kevinluo.autoglm.task.RuntimeInstruction
+import com.kevinluo.autoglm.task.RuntimeInstructionMode
+import com.kevinluo.autoglm.task.RuntimeInstructionStatus
 import com.kevinluo.autoglm.task.TaskExecutionManager
 import com.kevinluo.autoglm.task.TaskStep
 import com.kevinluo.autoglm.util.Logger
@@ -54,6 +57,9 @@ enum class TaskStatus {
 
     /** Task execution has been paused by the user. */
     PAUSED,
+
+    /** Waiting for the randomized delay before the next repeat round. */
+    WAITING_REPEAT,
 
     /** Task has completed successfully. */
     COMPLETED,
@@ -117,6 +123,9 @@ class FloatingWindowService :
         // Window size as percentage of screen
         private const val WIDTH_PERCENT = 0.80f
         private const val HEIGHT_PERCENT = 0.50f
+        private const val MENU_RUNTIME_CONTINUE = 1001
+        private const val MENU_RUNTIME_NEXT_STEP = 1002
+        private const val MAX_RUNTIME_SUMMARY_ITEMS = 3
 
         @Volatile
         private var instance: FloatingWindowService? = null
@@ -166,6 +175,13 @@ class FloatingWindowService :
                 updateStepsFromTaskManager(steps)
             }
         }
+
+        // Observe runtime instructions added while the current round is executing.
+        serviceScope.launch {
+            TaskExecutionManager.runtimeInstructions.collect { instructions ->
+                updateRuntimeInstructionSummary(instructions)
+            }
+        }
     }
 
     /**
@@ -188,6 +204,8 @@ class FloatingWindowService :
                 getString(R.string.step_counter_format, state.stepNumber)
         }
 
+        updateRepeatCountdown(state)
+
         // Update result message for completed/failed states
         if (state.status == TaskStatus.COMPLETED || state.status == TaskStatus.FAILED) {
             showResult(state.resultMessage, state.status == TaskStatus.COMPLETED)
@@ -209,6 +227,7 @@ class FloatingWindowService :
                     TaskStatus.IDLE -> R.string.task_status_idle to R.color.status_idle
                     TaskStatus.RUNNING -> R.string.task_status_running to R.color.status_running
                     TaskStatus.PAUSED -> R.string.task_status_paused to R.color.status_paused
+                    TaskStatus.WAITING_REPEAT -> R.string.task_status_waiting_repeat to R.color.status_waiting
                     TaskStatus.COMPLETED -> R.string.task_status_completed to R.color.status_completed
                     TaskStatus.FAILED -> R.string.task_status_failed to R.color.status_failed
                     TaskStatus.WAITING_CONFIRMATION -> R.string.floating_waiting_confirm to R.color.status_waiting
@@ -302,22 +321,19 @@ class FloatingWindowService :
      * After clearing focus, adds FLAG_NOT_FOCUSABLE so back key works in other apps.
      */
     private fun clearInputFocus() {
-        val taskInput = floatingView?.findViewById<EditText>(R.id.task_input) ?: return
-
-        if (!taskInput.hasFocus()) {
-            return
-        }
+        val inputs =
+            listOfNotNull(
+                floatingView?.findViewById<EditText>(R.id.task_input),
+                floatingView?.findViewById<EditText>(R.id.runtime_instruction_input),
+            )
+        val focusedInput = inputs.firstOrNull { it.hasFocus() } ?: return
 
         Logger.d(TAG, "clearInputFocus: clearing focus and hiding keyboard")
 
-        // Hide keyboard first
         val imm = getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(taskInput.windowToken, 0)
+        imm.hideSoftInputFromWindow(focusedInput.windowToken, 0)
+        inputs.forEach { it.clearFocus() }
 
-        // Clear focus
-        taskInput.clearFocus()
-
-        // Add FLAG_NOT_FOCUSABLE so back key works in other apps
         layoutParams?.let { params ->
             params.flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
             if (isAttached.get()) {
@@ -486,6 +502,7 @@ class FloatingWindowService :
                         TaskStatus.IDLE -> R.string.task_status_idle to R.color.status_idle
                         TaskStatus.RUNNING -> R.string.task_status_running to R.color.status_running
                         TaskStatus.PAUSED -> R.string.task_status_paused to R.color.status_paused
+                        TaskStatus.WAITING_REPEAT -> R.string.task_status_waiting_repeat to R.color.status_waiting
                         TaskStatus.COMPLETED -> R.string.task_status_completed to R.color.status_completed
                         TaskStatus.FAILED -> R.string.task_status_failed to R.color.status_failed
                         TaskStatus.WAITING_CONFIRMATION -> R.string.floating_waiting_confirm to R.color.status_waiting
@@ -559,6 +576,7 @@ class FloatingWindowService :
             // Clear task input field (UI-only operation)
             floatingView?.let { view ->
                 view.findViewById<EditText>(R.id.task_input)?.text?.clear()
+                view.findViewById<EditText>(R.id.runtime_instruction_input)?.text?.clear()
             }
 
             // Reset task state through TaskExecutionManager
@@ -645,6 +663,9 @@ class FloatingWindowService :
             val pauseBtn = view.findViewById<MaterialButton>(R.id.btn_pause)
             val resumeBtn = view.findViewById<MaterialButton>(R.id.btn_resume)
             val newTaskBtn = view.findViewById<MaterialButton>(R.id.btn_new_task)
+            val runtimeInstructionContainer =
+                view.findViewById<LinearLayout>(R.id.runtime_instruction_container)
+            val repeatCountdown = view.findViewById<TextView>(R.id.tv_repeat_countdown)
 
             Logger.d(TAG, "updateUIForStatus: inputArea=$inputArea, stepsRecycler=$stepsRecycler, stopBtn=$stopBtn")
 
@@ -655,6 +676,8 @@ class FloatingWindowService :
                     inputArea?.visibility = View.VISIBLE
                     stepsRecycler?.visibility = View.GONE
                     controlButtonsContainer?.visibility = View.GONE
+                    runtimeInstructionContainer?.visibility = View.GONE
+                    repeatCountdown?.visibility = View.GONE
                     newTaskBtn?.visibility = View.GONE
                 }
 
@@ -667,6 +690,8 @@ class FloatingWindowService :
                     pauseBtn?.visibility = View.VISIBLE
                     resumeBtn?.visibility = View.GONE
                     stopBtn?.visibility = View.VISIBLE
+                    runtimeInstructionContainer?.visibility = View.VISIBLE
+                    repeatCountdown?.visibility = View.GONE
                     newTaskBtn?.visibility = View.GONE
                 }
 
@@ -679,6 +704,22 @@ class FloatingWindowService :
                     pauseBtn?.visibility = View.GONE
                     resumeBtn?.visibility = View.VISIBLE
                     stopBtn?.visibility = View.VISIBLE
+                    runtimeInstructionContainer?.visibility = View.VISIBLE
+                    repeatCountdown?.visibility = View.GONE
+                    newTaskBtn?.visibility = View.GONE
+                }
+
+                TaskStatus.WAITING_REPEAT -> {
+                    // Keep the last round visible and allow the user to stop the repeat session.
+                    Logger.d(TAG, "updateUIForStatus: Waiting for next repeat round")
+                    inputArea?.visibility = View.GONE
+                    stepsRecycler?.visibility = View.VISIBLE
+                    controlButtonsContainer?.visibility = View.VISIBLE
+                    pauseBtn?.visibility = View.GONE
+                    resumeBtn?.visibility = View.GONE
+                    stopBtn?.visibility = View.VISIBLE
+                    runtimeInstructionContainer?.visibility = View.GONE
+                    repeatCountdown?.visibility = View.VISIBLE
                     newTaskBtn?.visibility = View.GONE
                 }
 
@@ -688,6 +729,8 @@ class FloatingWindowService :
                     inputArea?.visibility = View.GONE
                     stepsRecycler?.visibility = View.VISIBLE
                     controlButtonsContainer?.visibility = View.GONE
+                    runtimeInstructionContainer?.visibility = View.GONE
+                    repeatCountdown?.visibility = View.GONE
                     newTaskBtn?.visibility = View.VISIBLE
                 }
             }
@@ -729,6 +772,7 @@ class FloatingWindowService :
         setupDragBehavior()
         setupButtons()
         setupTaskInput()
+        setupRuntimeInstructionInput()
 
         // Initialize UI with current state from TaskExecutionManager instead of assuming IDLE
         // This fixes the bug where IDLE would overwrite the correct RUNNING status
@@ -737,6 +781,8 @@ class FloatingWindowService :
         currentStatus = currentState.status
         updateUIForStatus(currentState.status)
         updateStatusIndicator(currentState.status)
+        updateRepeatCountdown(currentState)
+        updateRuntimeInstructionSummary(TaskExecutionManager.runtimeInstructions.value)
         if (currentState.stepNumber > 0) {
             currentStepNumber = currentState.stepNumber
             floatingView?.findViewById<TextView>(R.id.tv_step_counter)?.text =
@@ -756,37 +802,37 @@ class FloatingWindowService :
     private fun setupTouchToClearFocus() {
         floatingView?.setOnTouchListener { _, event ->
             if (event.action == MotionEvent.ACTION_DOWN || event.action == MotionEvent.ACTION_OUTSIDE) {
-                val taskInput = floatingView?.findViewById<EditText>(R.id.task_input)
-                if (taskInput?.hasFocus() == true) {
+                val focusedInputs =
+                    listOfNotNull(
+                        floatingView?.findViewById<EditText>(R.id.task_input),
+                        floatingView?.findViewById<EditText>(R.id.runtime_instruction_input),
+                    ).filter { it.hasFocus() }
+
+                if (focusedInputs.isNotEmpty()) {
                     if (event.action == MotionEvent.ACTION_OUTSIDE) {
-                        // Touch outside window, clear focus
-                        Logger.d(TAG, "Touch outside window, clearing focus")
                         clearInputFocus()
                     } else {
-                        // Check if touch is outside the input field
-                        val inputLocation = IntArray(2)
-                        taskInput.getLocationOnScreen(inputLocation)
-                        val inputRect =
-                            android.graphics.Rect(
-                                inputLocation[0],
-                                inputLocation[1],
-                                inputLocation[0] + taskInput.width,
-                                inputLocation[1] + taskInput.height,
-                            )
-
-                        // Get touch position relative to screen
                         val touchX = event.rawX.toInt()
                         val touchY = event.rawY.toInt()
+                        val touchedFocusedInput =
+                            focusedInputs.any { input ->
+                                val location = IntArray(2)
+                                input.getLocationOnScreen(location)
+                                android.graphics.Rect(
+                                    location[0],
+                                    location[1],
+                                    location[0] + input.width,
+                                    location[1] + input.height,
+                                ).contains(touchX, touchY)
+                            }
 
-                        if (!inputRect.contains(touchX, touchY)) {
-                            // Touch is outside input, clear focus
-                            Logger.d(TAG, "Touch outside input, clearing focus")
+                        if (!touchedFocusedInput) {
                             clearInputFocus()
                         }
                     }
                 }
             }
-            false // Don't consume the event, let it propagate
+            false
         }
     }
 
@@ -935,6 +981,192 @@ class FloatingWindowService :
                 TaskExecutionManager.startTask(task)
             }
         }
+    }
+
+    /**
+     * Sets up the execution-time instruction input shown below Pause/Stop.
+     */
+    private fun setupRuntimeInstructionInput() {
+        val input = floatingView?.findViewById<EditText>(R.id.runtime_instruction_input)
+        val addButton = floatingView?.findViewById<MaterialButton>(R.id.btn_add_runtime_instruction)
+
+        input?.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                layoutParams?.let { params ->
+                    val wasNotFocusable =
+                        (params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0
+                    if (wasNotFocusable) {
+                        params.flags =
+                            params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+                        if (isAttached.get()) {
+                            try {
+                                windowManager?.updateViewLayout(floatingView, params)
+                                floatingView?.viewTreeObserver?.addOnWindowFocusChangeListener(
+                                    object : android.view.ViewTreeObserver.OnWindowFocusChangeListener {
+                                        override fun onWindowFocusChanged(hasFocus: Boolean) {
+                                            if (hasFocus) {
+                                                floatingView?.viewTreeObserver
+                                                    ?.removeOnWindowFocusChangeListener(this)
+                                                input.requestFocus()
+                                                val imm =
+                                                    getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager
+                                                imm.showSoftInput(
+                                                    input,
+                                                    InputMethodManager.SHOW_IMPLICIT,
+                                                )
+                                            }
+                                        }
+                                    },
+                                )
+                            } catch (e: Exception) {
+                                Logger.e(TAG, "Error enabling runtime instruction input focus", e)
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        addButton?.setOnClickListener { anchor ->
+            val content = input?.text?.toString()?.trim().orEmpty()
+            if (content.isBlank()) {
+                Toast.makeText(
+                    this,
+                    R.string.runtime_instruction_empty,
+                    Toast.LENGTH_SHORT,
+                ).show()
+                return@setOnClickListener
+            }
+            showRuntimeInstructionModePopup(anchor, input, content)
+        }
+    }
+
+    private fun showRuntimeInstructionModePopup(
+        anchor: View,
+        input: EditText?,
+        content: String,
+    ) {
+        val popup = android.widget.PopupMenu(this, anchor)
+        popup.menu.add(
+            0,
+            MENU_RUNTIME_CONTINUE,
+            0,
+            getString(R.string.runtime_instruction_continue),
+        )
+        popup.menu.add(
+            0,
+            MENU_RUNTIME_NEXT_STEP,
+            1,
+            getString(R.string.runtime_instruction_next_step),
+        )
+
+        popup.setOnMenuItemClickListener { item ->
+            val mode =
+                when (item.itemId) {
+                    MENU_RUNTIME_CONTINUE -> RuntimeInstructionMode.CONTINUE_CURRENT
+                    MENU_RUNTIME_NEXT_STEP -> RuntimeInstructionMode.NEXT_STEP
+                    else -> return@setOnMenuItemClickListener false
+                }
+
+            val added = TaskExecutionManager.addRuntimeInstruction(content, mode)
+            if (added) {
+                input?.text?.clear()
+                clearInputFocus()
+                Toast.makeText(
+                    this,
+                    R.string.runtime_instruction_added,
+                    Toast.LENGTH_SHORT,
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    R.string.runtime_instruction_unavailable,
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+            true
+        }
+        popup.show()
+    }
+
+    private fun updateRuntimeInstructionSummary(
+        instructions: List<RuntimeInstruction>,
+    ) {
+        val summaryView =
+            floatingView?.findViewById<TextView>(R.id.tv_runtime_instruction_summary)
+                ?: return
+
+        val pending =
+            instructions.filter {
+                it.status == RuntimeInstructionStatus.PENDING ||
+                    it.status == RuntimeInstructionStatus.EXECUTING
+            }
+
+        if (pending.isEmpty()) {
+            summaryView.visibility = View.GONE
+            summaryView.text = ""
+            return
+        }
+
+        val lines =
+            pending.take(MAX_RUNTIME_SUMMARY_ITEMS).map { instruction ->
+                val label =
+                    if (instruction.mode == RuntimeInstructionMode.CONTINUE_CURRENT) {
+                        getString(R.string.runtime_instruction_continue_short)
+                    } else {
+                        getString(R.string.runtime_instruction_next_step_short)
+                    }
+                "• $label：${instruction.content}"
+            }.toMutableList()
+
+        if (pending.size > MAX_RUNTIME_SUMMARY_ITEMS) {
+            lines +=
+                getString(
+                    R.string.runtime_instruction_more_format,
+                    pending.size - MAX_RUNTIME_SUMMARY_ITEMS,
+                )
+        }
+
+        summaryView.visibility = View.VISIBLE
+        summaryView.text =
+            getString(R.string.runtime_instruction_pending_format, pending.size) +
+                "\n" +
+                lines.joinToString("\n")
+    }
+
+    private fun updateRepeatCountdown(
+        state: com.kevinluo.autoglm.task.TaskExecutionState,
+    ) {
+        val countdownView =
+            floatingView?.findViewById<TextView>(R.id.tv_repeat_countdown)
+                ?: return
+
+        if (state.status != TaskStatus.WAITING_REPEAT) {
+            countdownView.visibility = View.GONE
+            return
+        }
+
+        val seconds = state.repeatRemainingSeconds.coerceAtLeast(0L)
+        val formatted =
+            if (seconds < 60L) {
+                getString(R.string.repeat_seconds_format, seconds)
+            } else {
+                getString(
+                    R.string.repeat_minutes_seconds_format,
+                    seconds / 60L,
+                    seconds % 60L,
+                )
+            }
+
+        countdownView.visibility = View.VISIBLE
+        countdownView.text =
+            getString(
+                R.string.repeat_countdown_format,
+                state.roundNumber,
+                state.roundNumber + 1,
+                formatted,
+            )
     }
 
     /**
@@ -1127,6 +1359,9 @@ class FloatingWindowService :
         val pauseBtn = floatingView?.findViewById<MaterialButton>(R.id.btn_pause)
         val resumeBtn = floatingView?.findViewById<MaterialButton>(R.id.btn_resume)
         val newTaskBtn = floatingView?.findViewById<MaterialButton>(R.id.btn_new_task)
+        val runtimeInstructionContainer =
+            floatingView?.findViewById<LinearLayout>(R.id.runtime_instruction_container)
+        val repeatCountdown = floatingView?.findViewById<TextView>(R.id.tv_repeat_countdown)
         val minimizeBtn = floatingView?.findViewById<ImageButton>(R.id.btn_minimize)
         val container = floatingView?.findViewById<View>(R.id.floating_window_container)
 
@@ -1145,6 +1380,8 @@ class FloatingWindowService :
             pauseBtn?.visibility = View.GONE
             resumeBtn?.visibility = View.GONE
             newTaskBtn?.visibility = View.GONE
+            runtimeInstructionContainer?.visibility = View.GONE
+            repeatCountdown?.visibility = View.GONE
             // Change icon to + (expand)
             minimizeBtn?.setImageResource(R.drawable.ic_plus)
 

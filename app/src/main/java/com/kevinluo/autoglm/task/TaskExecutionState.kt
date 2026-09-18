@@ -22,4 +22,10 @@ data class TaskExecutionState(
     val currentAction: String = "",
     val resultMessage: String = "",
     val taskDescription: String = "",
+    val roundNumber: Int = 0,
+    val repeatEnabled: Boolean = false,
+    val repeatRemainingSeconds: Long = 0L,
+    val nextRunAtMillis: Long? = null,
+    val pendingInstructionCount: Int = 0,
+    val queuedNextStepCount: Int = 0,
 )

@@ -99,7 +99,8 @@ class TaskFragmentPropertyTest :
                 val isConnected = shizukuStatus == ShizukuStatus.CONNECTED
                 val isNotRunning =
                     taskStatus != TaskStatus.RUNNING &&
-                        taskStatus != TaskStatus.PAUSED
+                        taskStatus != TaskStatus.PAUSED &&
+                        taskStatus != TaskStatus.WAITING_REPEAT
                 val hasOverlay = true // Assume granted for test
 
                 val state =

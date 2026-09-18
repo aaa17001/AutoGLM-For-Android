@@ -53,6 +53,15 @@
             app:tint="@color/icon_secondary" />
 
         <ImageButton
+            android:id="@+id/exportBtn"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/history_export_title"
+            android:src="@drawable/ic_download"
+            app:tint="@color/icon_secondary" />
+
+        <ImageButton
             android:id="@+id/shareBtn"
             android:layout_width="48dp"
             android:layout_height="48dp"

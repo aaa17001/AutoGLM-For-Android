@@ -20,10 +20,14 @@ import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
+import com.google.android.material.materialswitch.MaterialSwitch
 import com.google.android.material.textfield.TextInputEditText
+import com.google.android.material.textfield.TextInputLayout
 import com.kevinluo.autoglm.R
 import com.kevinluo.autoglm.settings.SettingsManager
 import com.kevinluo.autoglm.settings.TaskTemplate
+import com.kevinluo.autoglm.task.RepeatConfigError
+import com.kevinluo.autoglm.task.RepeatTaskConfig
 import com.kevinluo.autoglm.ui.FloatingWindowStateManager
 import com.kevinluo.autoglm.ui.MainUiState
 import com.kevinluo.autoglm.ui.MainViewModel
@@ -56,6 +60,8 @@ class TaskFragment : Fragment() {
     private lateinit var btnVoiceInput: ImageButton
     private lateinit var btnSelectTemplate: ImageButton
     private lateinit var btnStartTask: MaterialButton
+    private lateinit var btnRepeatConfig: MaterialButton
+    private var repeatConfig: RepeatTaskConfig = RepeatTaskConfig()
 
     // Floating Window Button
     private lateinit var btnFloatingWindow: ImageButton
@@ -86,8 +92,10 @@ class TaskFragment : Fragment() {
         Logger.d(TAG, "TaskFragment onViewCreated")
 
         settingsManager = SettingsManager.getInstance(requireContext())
+        repeatConfig = settingsManager.getRepeatTaskConfig()
 
         initViews(view)
+        updateRepeatButton()
         setupListeners()
         observeViewModel()
     }
@@ -107,6 +115,7 @@ class TaskFragment : Fragment() {
         btnVoiceInput = view.findViewById(R.id.btnVoiceInput)
         btnSelectTemplate = view.findViewById(R.id.btnSelectTemplate)
         btnStartTask = view.findViewById(R.id.btnStartTask)
+        btnRepeatConfig = view.findViewById(R.id.btnRepeatConfig)
 
         // Floating Window Button
         btnFloatingWindow = view.findViewById(R.id.btnFloatingWindow)
@@ -134,6 +143,11 @@ class TaskFragment : Fragment() {
         // Start task button
         btnStartTask.setOnClickListener {
             startTask()
+        }
+
+        // Repeat task configuration
+        btnRepeatConfig.setOnClickListener {
+            showRepeatConfigDialog()
         }
 
         // Floating window button
@@ -204,6 +218,7 @@ class TaskFragment : Fragment() {
     private fun updateUiState(state: MainUiState) {
         // Update start button state
         btnStartTask.isEnabled = state.canStartTask
+        btnRepeatConfig.isEnabled = !state.isTaskRunning
     }
 
     /**
@@ -240,7 +255,129 @@ class TaskFragment : Fragment() {
         }
 
         Logger.i(TAG, "Starting task: ${taskDescription.take(50)}...")
-        viewModel.startTask(taskDescription)
+        viewModel.startTask(
+            taskDescription = taskDescription,
+            repeatConfig = repeatConfig,
+        )
+    }
+
+    /**
+     * Shows and validates repeat-execution settings.
+     */
+    private fun showRepeatConfigDialog() {
+        val dialogView =
+            LayoutInflater.from(requireContext())
+                .inflate(R.layout.dialog_repeat_task, null)
+
+        val enabledSwitch = dialogView.findViewById<MaterialSwitch>(R.id.switchRepeatEnabled)
+        val minLayout = dialogView.findViewById<TextInputLayout>(R.id.repeatMinLayout)
+        val maxLayout = dialogView.findViewById<TextInputLayout>(R.id.repeatMaxLayout)
+        val minInput = dialogView.findViewById<TextInputEditText>(R.id.inputRepeatMin)
+        val maxInput = dialogView.findViewById<TextInputEditText>(R.id.inputRepeatMax)
+        val rangeHint = dialogView.findViewById<TextView>(R.id.tvRepeatRangeHint)
+
+        enabledSwitch.isChecked = repeatConfig.enabled
+        minInput.setText(repeatConfig.minMinutes.toString())
+        maxInput.setText(repeatConfig.maxMinutes.toString())
+
+        fun updateInputEnabledState() {
+            minLayout.isEnabled = enabledSwitch.isChecked
+            maxLayout.isEnabled = enabledSwitch.isChecked
+        }
+
+        fun updateRangeHint() {
+            val minMinutes = minInput.text?.toString()?.toIntOrNull()
+            val maxMinutes = maxInput.text?.toString()?.toIntOrNull()
+            if (minMinutes != null && maxMinutes != null && minMinutes > 0 && maxMinutes >= minMinutes) {
+                rangeHint.text =
+                    getString(
+                        R.string.repeat_random_hint_format,
+                        minMinutes.toLong() * 60L,
+                        maxMinutes.toLong() * 60L,
+                    )
+            } else {
+                rangeHint.setText(R.string.repeat_random_hint_default)
+            }
+        }
+
+        updateInputEnabledState()
+        updateRangeHint()
+
+        enabledSwitch.setOnCheckedChangeListener { _, _ ->
+            updateInputEnabledState()
+        }
+        minInput.doAfterTextChanged {
+            minLayout.error = null
+            updateRangeHint()
+        }
+        maxInput.doAfterTextChanged {
+            maxLayout.error = null
+            updateRangeHint()
+        }
+
+        val dialog =
+            MaterialAlertDialogBuilder(requireContext())
+                .setTitle(R.string.repeat_task_title)
+                .setView(dialogView)
+                .setNegativeButton(R.string.cancel, null)
+                .setPositiveButton(R.string.settings_save, null)
+                .showWithPrimaryButtons()
+
+        dialog.getButton(android.content.DialogInterface.BUTTON_POSITIVE).setOnClickListener {
+            val minMinutes = minInput.text?.toString()?.toIntOrNull()
+            val maxMinutes = maxInput.text?.toString()?.toIntOrNull()
+
+            minLayout.error = null
+            maxLayout.error = null
+
+            if (minMinutes == null) {
+                minLayout.error = getString(R.string.repeat_validation_number)
+                return@setOnClickListener
+            }
+            if (maxMinutes == null) {
+                maxLayout.error = getString(R.string.repeat_validation_number)
+                return@setOnClickListener
+            }
+
+            val newConfig =
+                RepeatTaskConfig(
+                    enabled = enabledSwitch.isChecked,
+                    minMinutes = minMinutes,
+                    maxMinutes = maxMinutes,
+                )
+
+            when (newConfig.validationError()) {
+                RepeatConfigError.MIN_MUST_BE_POSITIVE -> {
+                    minLayout.error = getString(R.string.repeat_validation_min)
+                    return@setOnClickListener
+                }
+
+                RepeatConfigError.MAX_LESS_THAN_MIN -> {
+                    maxLayout.error = getString(R.string.repeat_validation_range)
+                    return@setOnClickListener
+                }
+
+                null -> Unit
+            }
+
+            repeatConfig = newConfig
+            settingsManager.saveRepeatTaskConfig(newConfig)
+            updateRepeatButton()
+            dialog.dismiss()
+        }
+    }
+
+    private fun updateRepeatButton() {
+        btnRepeatConfig.text =
+            if (repeatConfig.enabled) {
+                getString(
+                    R.string.repeat_enabled_format,
+                    repeatConfig.minMinutes,
+                    repeatConfig.maxMinutes,
+                )
+            } else {
+                getString(R.string.repeat_disabled)
+            }
     }
 
     /**

@@ -22,9 +22,11 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.kevinluo.autoglm.BaseActivity
 import com.kevinluo.autoglm.R
 import com.kevinluo.autoglm.util.Logger
+import com.kevinluo.autoglm.util.showWithPrimaryButtons
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -52,6 +54,7 @@ import java.util.Locale
  */
 class HistoryDetailActivity : BaseActivity() {
     private lateinit var historyManager: HistoryManager
+    private lateinit var historyExporter: HistoryExporter
     private var taskId: String? = null
     private var task: TaskHistory? = null
 
@@ -66,6 +69,7 @@ class HistoryDetailActivity : BaseActivity() {
         setupEdgeToEdgeInsets(R.id.rootLayout, applyTop = true, applyBottom = false)
 
         historyManager = HistoryManager.getInstance(this)
+        historyExporter = HistoryExporter(this)
         taskId = intent.getStringExtra(EXTRA_TASK_ID)
 
         Logger.d(TAG, "HistoryDetailActivity created for task: $taskId")
@@ -87,6 +91,10 @@ class HistoryDetailActivity : BaseActivity() {
 
         findViewById<ImageButton>(R.id.saveImageBtn).setOnClickListener {
             saveAsImage()
+        }
+
+        findViewById<ImageButton>(R.id.exportBtn).setOnClickListener {
+            showExportOptions()
         }
 
         findViewById<ImageButton>(R.id.shareBtn).setOnClickListener {
@@ -183,6 +191,88 @@ class HistoryDetailActivity : BaseActivity() {
             seconds < 3600 -> "${seconds / 60}分${seconds % 60}秒"
             else -> "${seconds / 3600}时${(seconds % 3600) / 60}分"
         }
+    }
+
+    private fun showExportOptions() {
+        val options =
+            arrayOf(
+                getString(R.string.history_export_markdown),
+                getString(R.string.history_export_json),
+                getString(R.string.history_export_zip),
+            )
+
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.history_export_title)
+            .setItems(options) { _, which ->
+                val format =
+                    when (which) {
+                        0 -> ExportFormat.MARKDOWN
+                        1 -> ExportFormat.JSON
+                        else -> ExportFormat.ZIP
+                    }
+                exportHistory(format)
+            }
+            .setNegativeButton(R.string.cancel, null)
+            .showWithPrimaryButtons()
+    }
+
+    private fun exportHistory(format: ExportFormat) {
+        val currentTask = task ?: return
+
+        Toast.makeText(
+            this,
+            R.string.history_export_generating,
+            Toast.LENGTH_SHORT,
+        ).show()
+
+        lifecycleScope.launch {
+            try {
+                val file =
+                    when (format) {
+                        ExportFormat.MARKDOWN -> historyExporter.exportMarkdown(currentTask)
+                        ExportFormat.JSON -> historyExporter.exportJson(currentTask)
+                        ExportFormat.ZIP -> historyExporter.exportZip(currentTask)
+                    }
+
+                Toast.makeText(
+                    this@HistoryDetailActivity,
+                    R.string.history_export_ready,
+                    Toast.LENGTH_SHORT,
+                ).show()
+                shareExportFile(file)
+            } catch (e: Exception) {
+                Logger.e(TAG, "History export failed", e)
+                Toast.makeText(
+                    this@HistoryDetailActivity,
+                    R.string.history_export_failed,
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+
+    private fun shareExportFile(file: File) {
+        val uri =
+            FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                file,
+            )
+
+        val intent =
+            Intent(Intent.ACTION_SEND).apply {
+                type = historyExporter.mimeTypeForExtension(file.extension)
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, getString(R.string.history_export_title))
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+        startActivity(
+            Intent.createChooser(
+                intent,
+                getString(R.string.history_export_share_title),
+            ),
+        )
     }
 
     /**
@@ -615,6 +705,12 @@ class HistoryDetailActivity : BaseActivity() {
 
             true
         }
+    }
+
+    private enum class ExportFormat {
+        MARKDOWN,
+        JSON,
+        ZIP,
     }
 
     companion object {

@@ -10,6 +10,9 @@ import com.kevinluo.autoglm.history.HistoryManager
 import com.kevinluo.autoglm.model.ModelClient
 import com.kevinluo.autoglm.model.ModelResult
 import com.kevinluo.autoglm.screenshot.ScreenshotService
+import com.kevinluo.autoglm.task.RuntimeInstruction
+import com.kevinluo.autoglm.task.RuntimeInstructionSource
+import com.kevinluo.autoglm.task.RoundFinishResolution
 import com.kevinluo.autoglm.util.ErrorHandler
 import com.kevinluo.autoglm.util.Logger
 import kotlinx.coroutines.CancellationException
@@ -239,7 +242,34 @@ class PhoneAgent(
      * @return TaskResult containing success status, message, and step count
      *
      */
-    suspend fun run(task: String): TaskResult = coroutineScope {
+    suspend fun run(task: String): TaskResult =
+        runInternal(
+            task = task,
+            instructionSource = null,
+            manageHistoryLifecycle = true,
+        )
+
+    /**
+     * Runs one manager-owned task round.
+     *
+     * History session start/completion is owned by TaskExecutionManager so multiple repeat rounds
+     * remain inside one history record. Step recording still happens normally.
+     */
+    suspend fun runManagedRound(
+        task: String,
+        instructionSource: RuntimeInstructionSource,
+    ): TaskResult =
+        runInternal(
+            task = task,
+            instructionSource = instructionSource,
+            manageHistoryLifecycle = false,
+        )
+
+    private suspend fun runInternal(
+        task: String,
+        instructionSource: RuntimeInstructionSource?,
+        manageHistoryLifecycle: Boolean,
+    ): TaskResult = coroutineScope {
         // Validate task description (Requirement 1.2)
         if (!isValidTask(task)) {
             Logger.w(TAG, "Task validation failed: empty or whitespace only")
@@ -262,27 +292,30 @@ class PhoneAgent(
 
         currentStepNumber = 0
 
-        // Initialize context with system prompt based on language setting
+        // Each round starts with a fresh Agent conversation context.
         val systemPrompt = SystemPrompts.getPrompt(config.language)
         context.set(AgentContext(systemPrompt))
 
-        // Start history recording
-        historyManager?.startTask(task)
+        if (manageHistoryLifecycle) {
+            historyManager?.startTask(task)
+        }
 
         Logger.logTaskStart(task)
 
-        // Track if we've already completed history to avoid duplicates
-        var historyCompleted = false
+        // Manager-owned rounds deliberately leave history open across repeat rounds.
+        var historyCompleted = !manageHistoryLifecycle
         val cancellationMsg = getCancellationMessage()
 
         try {
             var stepCount = 0
             var lastMessage = ""
             var success = true
+            var finishedNormally = false
             var nextStepHint: String? = null
+            var pendingRuntimeDirective: String? = null
+            var activeQueuedInstruction: RuntimeInstruction? = null
 
-            // Execute steps until finished or max steps reached
-            // When maxSteps is 0, run indefinitely (no limit)
+            // Execute steps until the complete round (including queued follow-up stages) finishes.
             while (config.maxSteps == 0 || stepCount < config.maxSteps) {
                 ensureActive()
 
@@ -293,7 +326,6 @@ class PhoneAgent(
                         historyManager?.completeTask(false, cancellationMsg)
                         historyCompleted = true
                     }
-                    // Don't call listener here - let the caller handle UI updates
                     return@coroutineScope TaskResult(
                         success = false,
                         message = cancellationMsg,
@@ -301,19 +333,33 @@ class PhoneAgent(
                     )
                 }
 
-                // Execute single step, passing hint from previous step if any
+                // Runtime instructions are consumed only at a safe boundary before a new Agent step.
+                val applyAtStep = currentStepNumber + 1
+                val immediateInstructions =
+                    instructionSource
+                        ?.consumeImmediateInstructions(applyAtStep)
+                        .orEmpty()
+
+                val runtimeDirective =
+                    combineRuntimeDirectives(
+                        pendingRuntimeDirective,
+                        buildImmediateInstructionDirective(immediateInstructions),
+                    )
+                pendingRuntimeDirective = null
+
                 val stepResult =
                     executeStep(
                         task = if (stepCount == 0) task else null,
                         hint = nextStepHint,
+                        runtimeDirective = runtimeDirective,
                     )
 
-                // Handle pause - wait for resume and retry the step
+                // A paused/retried step must receive the same injected directive again.
                 if (stepResult.paused) {
+                    pendingRuntimeDirective = runtimeDirective
                     Logger.i(TAG, "Step returned paused, waiting for resume...")
                     waitWhilePaused()
 
-                    // Check if cancelled while paused
                     if (_state.value == AgentState.CANCELLED) {
                         Logger.i(TAG, "Task cancelled while paused")
                         if (!historyCompleted) {
@@ -327,18 +373,14 @@ class PhoneAgent(
                         )
                     }
 
-                    // Resume - continue loop to retry the step (stepCount not incremented)
                     Logger.i(TAG, "Resumed, retrying step...")
                     continue
                 }
 
                 stepCount++
-
-                // Store hint for next step
                 nextStepHint = stepResult.nextStepHint
 
                 if (!stepResult.success) {
-                    // Check if this failure is due to cancellation
                     if (_state.value == AgentState.CANCELLED) {
                         Logger.i(TAG, "Task cancelled at step $stepCount")
                         if (!historyCompleted) {
@@ -355,28 +397,81 @@ class PhoneAgent(
                     success = false
                     lastMessage = stepResult.message ?: "Step execution failed"
                     Logger.w(TAG, "Step $stepCount failed: $lastMessage")
-                    // Don't call listener here - let the caller handle UI updates
                     break
                 }
 
                 if (stepResult.finished) {
+                    if (instructionSource != null) {
+                        when (
+                            val resolution =
+                                instructionSource.resolveRoundFinish(currentStepNumber + 1)
+                        ) {
+                            is RoundFinishResolution.ApplyImmediate -> {
+                                // A correction accepted before the atomic close belongs to the
+                                // stage that just attempted to Finish. Do not mark an active
+                                // queued stage complete until that correction also reaches Finish.
+                                pendingRuntimeDirective =
+                                    buildImmediateInstructionDirective(resolution.instructions)
+                                nextStepHint = null
+                                lastMessage = stepResult.message ?: "Task stage completed"
+                                Logger.i(
+                                    TAG,
+                                    "Finish deferred: applying " +
+                                        "${resolution.instructions.size} runtime instruction(s)",
+                                )
+                                continue
+                            }
+
+                            is RoundFinishResolution.ExecuteNext -> {
+                                // No correction is pending for the finishing stage, so it is now
+                                // safe to mark that stage complete before switching to the next one.
+                                activeQueuedInstruction?.let { instruction ->
+                                    instructionSource.markNextStepCompleted(
+                                        instructionId = instruction.id,
+                                        completedAtStep = currentStepNumber,
+                                    )
+                                }
+
+                                activeQueuedInstruction = resolution.instruction
+                                pendingRuntimeDirective =
+                                    buildNextStepInstructionDirective(resolution.instruction)
+                                nextStepHint = null
+                                lastMessage = stepResult.message ?: "Task stage completed"
+                                Logger.i(
+                                    TAG,
+                                    "Continuing with queued next-step instruction: " +
+                                        resolution.instruction.content.take(80),
+                                )
+                                continue
+                            }
+
+                            RoundFinishResolution.Finish -> {
+                                activeQueuedInstruction?.let { instruction ->
+                                    instructionSource.markNextStepCompleted(
+                                        instructionId = instruction.id,
+                                        completedAtStep = currentStepNumber,
+                                    )
+                                }
+                                activeQueuedInstruction = null
+                            }
+                        }
+                    }
+
                     lastMessage = stepResult.message ?: "Task completed"
+                    finishedNormally = true
                     Logger.i(TAG, "Task finished at step $stepCount: $lastMessage")
-                    // Don't call listener here - let the caller handle UI updates
                     break
                 }
 
                 lastMessage = stepResult.message ?: ""
             }
 
-            // Check if max steps reached (only when maxSteps > 0)
-            if (config.maxSteps > 0 && stepCount >= config.maxSteps) {
+            if (!finishedNormally && success && config.maxSteps > 0 && stepCount >= config.maxSteps) {
                 lastMessage = "Maximum steps (${config.maxSteps}) reached"
                 Logger.w(TAG, lastMessage)
                 success = false
             }
 
-            // Complete history recording (only if not already done)
             if (!historyCompleted) {
                 historyManager?.completeTask(success, lastMessage)
                 historyCompleted = true
@@ -394,6 +489,7 @@ class PhoneAgent(
             Logger.i(TAG, "Task cancelled via coroutine cancellation")
             if (!historyCompleted) {
                 historyManager?.completeTask(false, cancellationMsg)
+                historyCompleted = true
             }
             TaskResult(
                 success = false,
@@ -401,11 +497,11 @@ class PhoneAgent(
                 stepCount = currentStepNumber,
             )
         } catch (e: Exception) {
-            // Always check if cancelled first - user cancellation takes priority over any other error
             if (_state.value == AgentState.CANCELLED) {
                 Logger.i(TAG, "Task cancelled, ignoring exception: ${e.message}")
                 if (!historyCompleted) {
                     historyManager?.completeTask(false, cancellationMsg)
+                    historyCompleted = true
                 }
                 return@coroutineScope TaskResult(
                     success = false,
@@ -418,6 +514,7 @@ class PhoneAgent(
             Logger.e(TAG, ErrorHandler.formatErrorForLog(handledError), e)
             if (!historyCompleted) {
                 historyManager?.completeTask(false, handledError.userMessage)
+                historyCompleted = true
             }
             TaskResult(
                 success = false,
@@ -429,6 +526,41 @@ class PhoneAgent(
         }
     }
 
+    private fun buildImmediateInstructionDirective(
+        instructions: List<RuntimeInstruction>,
+    ): String? {
+        if (instructions.isEmpty()) return null
+
+        val content =
+            instructions.joinToString(separator = "\n") { instruction ->
+                "- ${instruction.content}"
+            }
+
+        return """【用户在任务执行过程中追加要求】
+$content
+
+请优先遵守以上最新要求，并结合此前任务上下文继续执行。"""
+    }
+
+    private fun buildNextStepInstructionDirective(
+        instruction: RuntimeInstruction,
+    ): String =
+        """【当前任务阶段已完成】
+用户追加了下一步要求：
+${instruction.content}
+
+请保留此前上下文和当前手机页面状态，继续完成这个下一步要求。"""
+
+    private fun combineRuntimeDirectives(
+        first: String?,
+        second: String?,
+    ): String? =
+        listOfNotNull(
+            first?.takeIf { it.isNotBlank() },
+            second?.takeIf { it.isNotBlank() },
+        ).takeIf { it.isNotEmpty() }
+            ?.joinToString(separator = "\n\n")
+
     /**
      * Executes a single step of the task.
      *
@@ -436,7 +568,11 @@ class PhoneAgent(
      * @param hint Optional hint from previous step (e.g., app not found, need to search on screen)
      * @return StepResult containing step outcome
      */
-    private suspend fun executeStep(task: String?, hint: String? = null): StepResult {
+    private suspend fun executeStep(
+        task: String?,
+        hint: String? = null,
+        runtimeDirective: String? = null,
+    ): StepResult {
         // Wait if paused (check at the beginning of each step)
         waitWhilePaused()
 
@@ -544,10 +680,31 @@ class PhoneAgent(
 
             // Build user message
             val userText =
-                when {
-                    task != null -> "任务: $task\n当前屏幕截图如下:"
-                    hint != null -> "上一步执行结果: $hint\n继续执行任务，当前屏幕截图如下:"
-                    else -> "继续执行任务，当前屏幕截图如下:"
+                buildString {
+                    if (task != null) {
+                        append("任务: ")
+                        append(task)
+                        append("\n")
+                    }
+
+                    if (!runtimeDirective.isNullOrBlank()) {
+                        if (isNotEmpty()) append("\n")
+                        append(runtimeDirective)
+                        append("\n")
+                    }
+
+                    if (!hint.isNullOrBlank()) {
+                        if (isNotEmpty()) append("\n")
+                        append("上一步执行结果: ")
+                        append(hint)
+                        append("\n")
+                    }
+
+                    if (isEmpty()) {
+                        append("继续执行任务\n")
+                    }
+
+                    append("当前屏幕截图如下:")
                 }
 
             // Add user message to context (screenshot is passed separately to model)

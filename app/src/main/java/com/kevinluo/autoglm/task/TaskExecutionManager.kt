@@ -1,64 +1,73 @@
 package com.kevinluo.autoglm.task
 
 import android.content.Context
+import android.os.SystemClock
 import com.kevinluo.autoglm.ComponentManager
 import com.kevinluo.autoglm.action.AgentAction
 import com.kevinluo.autoglm.agent.AgentState
+import com.kevinluo.autoglm.agent.PhoneAgent
 import com.kevinluo.autoglm.agent.PhoneAgentListener
+import com.kevinluo.autoglm.history.HistoryManager
 import com.kevinluo.autoglm.ui.FloatingWindowStateManager
 import com.kevinluo.autoglm.ui.TaskStatus
 import com.kevinluo.autoglm.util.Logger
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Singleton manager for task execution state.
  *
- * This is the single source of truth for task execution state in the application.
- * Both [MainViewModel] and [FloatingWindowService] observe this manager's StateFlows
- * to keep their UIs synchronized.
- *
- * Implements [PhoneAgentListener] to receive callbacks from [PhoneAgent] and
- * update the state accordingly.
+ * This is the single source of truth for a complete task session. A session can contain multiple
+ * repeat rounds, and each round can accept runtime user instructions.
  */
-object TaskExecutionManager : PhoneAgentListener {
+object TaskExecutionManager :
+    PhoneAgentListener,
+    RuntimeInstructionSource {
     private const val TAG = "TaskExecutionManager"
     private const val PHONE_AGENT_POLL_INTERVAL_MS = 500L
+    private const val CANCELLED_MESSAGE = "任务已取消"
 
     private var applicationContext: Context? = null
     private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
-    // Primary state flow for task execution state
     private val _taskState = MutableStateFlow(TaskExecutionState())
 
-    /**
-     * Observable task execution state.
-     *
-     * UI components should observe this StateFlow to receive task state updates.
-     */
+    /** Observable task/session state. */
     val taskState: StateFlow<TaskExecutionState> = _taskState.asStateFlow()
 
-    // Steps list for waterfall display
     private val _steps = MutableStateFlow<List<TaskStep>>(emptyList())
 
-    /**
-     * Observable list of task steps for waterfall display.
-     *
-     * Each step contains the step number, thinking text, and action.
-     */
+    /** Observable Agent steps for the current round. */
     val steps: StateFlow<List<TaskStep>> = _steps.asStateFlow()
 
+    private val instructionQueue = RuntimeInstructionQueue()
+    private val instructionStateLock = Any()
+    private var roundAcceptingInstructions = false
+    private val _runtimeInstructions = MutableStateFlow<List<RuntimeInstruction>>(emptyList())
+
+    /** Runtime instructions for the current round, including completed items until the round ends. */
+    val runtimeInstructions: StateFlow<List<RuntimeInstruction>> = _runtimeInstructions.asStateFlow()
+
+    private var sessionJob: Job? = null
+    private var currentRoundNumber: Int = 0
+    private var currentRepeatConfig: RepeatTaskConfig = RepeatTaskConfig()
+
     /**
-     * Initializes the TaskExecutionManager with application context.
-     *
-     * Should be called in [AutoGLMApplication.onCreate] after [ComponentManager] is initialized.
-     *
-     * @param context Application context
+     * Initializes the manager with application context.
      */
     fun initialize(context: Context) {
         applicationContext = context.applicationContext
@@ -66,123 +75,314 @@ object TaskExecutionManager : PhoneAgentListener {
         observePhoneAgentAvailability()
     }
 
-    /**
-     * Observes ComponentManager.phoneAgent availability and registers/unregisters as listener.
-     *
-     * When phoneAgent becomes available, registers this manager as PhoneAgentListener.
-     * When phoneAgent becomes null, unregisters.
-     */
     private fun observePhoneAgentAvailability() {
         managerScope.launch {
-            var lastPhoneAgent: com.kevinluo.autoglm.agent.PhoneAgent? = null
+            var lastPhoneAgent: PhoneAgent? = null
 
-            // Poll for phoneAgent availability changes
-            // This is a simple approach since ComponentManager doesn't expose a StateFlow for phoneAgent
             while (true) {
                 val componentManager = getComponentManager()
                 val currentPhoneAgent = componentManager?.phoneAgent
 
                 if (currentPhoneAgent != lastPhoneAgent) {
-                    if (lastPhoneAgent != null) {
-                        // Unregister from previous phoneAgent
-                        lastPhoneAgent.setListener(null)
+                    lastPhoneAgent?.let {
+                        it.setListener(null)
                         Logger.i(TAG, "Unregistered as PhoneAgentListener")
                     }
 
-                    if (currentPhoneAgent != null) {
-                        // Register with new phoneAgent
-                        currentPhoneAgent.setListener(this@TaskExecutionManager)
+                    currentPhoneAgent?.let {
+                        it.setListener(this@TaskExecutionManager)
                         Logger.i(TAG, "Registered as PhoneAgentListener")
                     }
 
                     lastPhoneAgent = currentPhoneAgent
                 }
 
-                kotlinx.coroutines.delay(PHONE_AGENT_POLL_INTERVAL_MS)
+                delay(PHONE_AGENT_POLL_INTERVAL_MS)
             }
         }
     }
 
-    /**
-     * Gets the ComponentManager instance.
-     *
-     * @return ComponentManager instance or null if not initialized
-     */
     private fun getComponentManager(): ComponentManager? {
         val ctx = applicationContext ?: return null
         return ComponentManager.getInstance(ctx)
     }
 
-    // region Task Control Methods
+    private fun getHistoryManager(): HistoryManager? {
+        val ctx = applicationContext ?: return null
+        return HistoryManager.getInstance(ctx)
+    }
+
+    // region Task/session control
 
     /**
-     * Starts a new task with the given description.
-     *
-     * @param description The task description to execute
-     * @return true if task was started successfully, false otherwise
+     * Starts a new session. Round 1 starts immediately.
      */
-    fun startTask(description: String): Boolean {
+    fun startTask(
+        description: String,
+        repeatConfig: RepeatTaskConfig = RepeatTaskConfig(),
+    ): Boolean {
+        if (description.isBlank()) {
+            Logger.w(TAG, "Cannot start task: empty description")
+            return false
+        }
+
+        if (!repeatConfig.isValid()) {
+            Logger.w(TAG, "Cannot start task: invalid repeat config $repeatConfig")
+            return false
+        }
+
         if (!canStartTask()) {
             Logger.w(TAG, "Cannot start task: preconditions not met")
             return false
         }
 
         val componentManager = getComponentManager() ?: return false
-        val agent = componentManager.phoneAgent ?: return false
+        componentManager.phoneAgent ?: return false
 
-        // Update state to running
+        currentRepeatConfig = repeatConfig
+        currentRoundNumber = 0
+        instructionQueue.clear()
+        _runtimeInstructions.value = emptyList()
+        _steps.value = emptyList()
+
         _taskState.value =
             TaskExecutionState(
                 status = TaskStatus.RUNNING,
                 taskDescription = description,
+                roundNumber = 1,
+                repeatEnabled = repeatConfig.enabled,
             )
 
-        // Clear previous steps
-        _steps.value = emptyList()
+        Logger.i(
+            TAG,
+            "Starting task session: repeat=${repeatConfig.enabled}, task=${description.take(50)}...",
+        )
 
-        Logger.i(TAG, "Starting task: ${description.take(50)}...")
-
-        // Launch task execution in coroutine
-        managerScope.launch {
-            try {
-                val result = agent.run(description)
-
-                if (result.success) {
-                    Logger.i(TAG, "Task completed successfully: ${result.message}")
-                    _taskState.value =
-                        _taskState.value.copy(
-                            status = TaskStatus.COMPLETED,
-                            resultMessage = result.message,
-                        )
-                } else {
-                    Logger.w(TAG, "Task failed: ${result.message}")
-                    _taskState.value =
-                        _taskState.value.copy(
-                            status = TaskStatus.FAILED,
-                            resultMessage = result.message,
-                        )
-                }
-            } catch (e: Exception) {
-                Logger.e(TAG, "Task error: ${e.message}", e)
-                _taskState.value =
-                    _taskState.value.copy(
-                        status = TaskStatus.FAILED,
-                        resultMessage = e.message ?: "Unknown error",
-                    )
+        val job =
+            managerScope.launch(start = CoroutineStart.LAZY) {
+                runSession(
+                    description = description,
+                    repeatConfig = repeatConfig,
+                )
             }
+        sessionJob = job
+        job.start()
+        return true
+    }
+
+    private suspend fun runSession(
+        description: String,
+        repeatConfig: RepeatTaskConfig,
+    ) {
+        val historyManager = getHistoryManager()
+        val ctx = applicationContext
+
+        var sessionSuccess = false
+        var finalMessage = ""
+        var finalStatus = TaskStatus.FAILED
+
+        try {
+            historyManager?.startTask(
+                taskDescription = description,
+                repeatConfig = repeatConfig,
+            )
+            if (ctx != null) {
+                FloatingWindowStateManager.onTaskStarted(ctx)
+            }
+
+            var roundNumber = 1
+            while (currentCoroutineContext().isActive) {
+                currentRoundNumber = roundNumber
+                clearRuntimeInstructionsForNewRound()
+                _steps.value = emptyList()
+
+                historyManager?.startRound(roundNumber)
+
+                _taskState.value =
+                    TaskExecutionState(
+                        status = TaskStatus.RUNNING,
+                        taskDescription = description,
+                        roundNumber = roundNumber,
+                        repeatEnabled = repeatConfig.enabled,
+                    )
+
+                val agent = getComponentManager()?.phoneAgent
+                if (agent == null) {
+                    finalMessage = "代理未就绪，无法开始下一轮"
+                    finalStatus = TaskStatus.FAILED
+                    Logger.w(TAG, finalMessage)
+                    break
+                }
+                agent.setListener(this)
+
+                Logger.i(TAG, "Starting round $roundNumber")
+                val result =
+                    agent.runManagedRound(
+                        task = description,
+                        instructionSource = this,
+                    )
+
+                historyManager?.completeRound(
+                    roundNumber = roundNumber,
+                    success = result.success,
+                    message = result.message,
+                )
+
+                finalMessage = result.message
+
+                if (!result.success) {
+                    finalStatus = TaskStatus.FAILED
+                    Logger.w(TAG, "Round $roundNumber failed: ${result.message}")
+                    break
+                }
+
+                if (!repeatConfig.enabled) {
+                    sessionSuccess = true
+                    finalStatus = TaskStatus.COMPLETED
+                    Logger.i(TAG, "Single-round task session completed")
+                    break
+                }
+
+                val delaySeconds = repeatConfig.randomDelaySeconds()
+                val nextRunAtMillis = System.currentTimeMillis() + delaySeconds * 1000L
+
+                historyManager?.recordRepeatScheduled(
+                    roundNumber = roundNumber,
+                    delaySeconds = delaySeconds,
+                    nextRunAtMillis = nextRunAtMillis,
+                )
+
+                waitForNextRound(
+                    delaySeconds = delaySeconds,
+                    nextRunAtMillis = nextRunAtMillis,
+                )
+
+                roundNumber++
+            }
+        } catch (e: CancellationException) {
+            finalMessage = CANCELLED_MESSAGE
+            finalStatus = TaskStatus.FAILED
+            Logger.i(TAG, "Task session cancelled")
+        } catch (e: Exception) {
+            finalMessage = e.message ?: "Unknown error"
+            finalStatus = TaskStatus.FAILED
+            Logger.e(TAG, "Task session error: ${e.message}", e)
+        } finally {
+            val completionMessage =
+                finalMessage.ifBlank {
+                    if (sessionSuccess) "任务已完成" else CANCELLED_MESSAGE
+                }
+
+            _taskState.value =
+                _taskState.value.copy(
+                    status = finalStatus,
+                    resultMessage = completionMessage,
+                    repeatRemainingSeconds = 0L,
+                    nextRunAtMillis = null,
+                    pendingInstructionCount = 0,
+                    queuedNextStepCount = 0,
+                )
+
+            withContext(NonCancellable) {
+                historyManager?.completeTask(
+                    success = sessionSuccess,
+                    message = completionMessage,
+                )
+            }
+
+            synchronized(instructionStateLock) {
+                roundAcceptingInstructions = false
+                instructionQueue.clear()
+                _runtimeInstructions.value = emptyList()
+            }
+            FloatingWindowStateManager.onTaskCompleted()
+
+            currentRepeatConfig = RepeatTaskConfig()
+            sessionJob = null
+        }
+    }
+
+    private suspend fun waitForNextRound(
+        delaySeconds: Long,
+        nextRunAtMillis: Long,
+    ) {
+        val targetElapsedRealtime = SystemClock.elapsedRealtime() + delaySeconds * 1000L
+
+        while (true) {
+            currentCoroutineContext().ensureActive()
+
+            val remainingMillis = targetElapsedRealtime - SystemClock.elapsedRealtime()
+            if (remainingMillis <= 0L) {
+                break
+            }
+
+            val remainingSeconds = (remainingMillis + 999L) / 1000L
+            _taskState.value =
+                _taskState.value.copy(
+                    status = TaskStatus.WAITING_REPEAT,
+                    repeatRemainingSeconds = remainingSeconds,
+                    nextRunAtMillis = nextRunAtMillis,
+                )
+
+            delay(minOf(remainingMillis, 1000L))
         }
 
+        _taskState.value =
+            _taskState.value.copy(
+                repeatRemainingSeconds = 0L,
+                nextRunAtMillis = null,
+            )
+    }
+
+    /**
+     * Adds a user instruction while the current round is running or paused.
+     */
+    fun addRuntimeInstruction(
+        content: String,
+        mode: RuntimeInstructionMode,
+    ): Boolean {
+        val normalized = content.trim()
+        if (normalized.isEmpty()) return false
+
+        val instruction =
+            synchronized(instructionStateLock) {
+                val status = _taskState.value.status
+                if (
+                    !roundAcceptingInstructions ||
+                    (status != TaskStatus.RUNNING && status != TaskStatus.PAUSED)
+                ) {
+                    Logger.w(
+                        TAG,
+                        "Runtime instruction rejected: accepting=$roundAcceptingInstructions, state=$status",
+                    )
+                    return false
+                }
+
+                RuntimeInstruction(
+                    content = normalized,
+                    mode = mode,
+                    roundNumber = currentRoundNumber.coerceAtLeast(1),
+                    addedAtStep = _taskState.value.stepNumber,
+                ).also { queued ->
+                    instructionQueue.add(queued)
+                    _runtimeInstructions.value = _runtimeInstructions.value + queued
+                    updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionAdded(queued)
+                }
+            }
+
+        Logger.i(
+            TAG,
+            "Queued runtime instruction: mode=$mode, step=${instruction.addedAtStep}",
+        )
         return true
     }
 
     /**
-     * Pauses the currently running task.
-     *
-     * @return true if task was paused successfully, false otherwise
+     * Pauses the currently running Agent round.
      */
     fun pauseTask(): Boolean {
-        val componentManager = getComponentManager() ?: return false
-        val agent = componentManager.phoneAgent ?: return false
+        val agent = getComponentManager()?.phoneAgent ?: return false
 
         val paused = agent.pause()
         if (paused) {
@@ -195,13 +395,10 @@ object TaskExecutionManager : PhoneAgentListener {
     }
 
     /**
-     * Resumes the paused task.
-     *
-     * @return true if task was resumed successfully, false otherwise
+     * Resumes a paused Agent round.
      */
     fun resumeTask(): Boolean {
-        val componentManager = getComponentManager() ?: return false
-        val agent = componentManager.phoneAgent ?: return false
+        val agent = getComponentManager()?.phoneAgent ?: return false
 
         val resumed = agent.resume()
         if (resumed) {
@@ -214,87 +411,240 @@ object TaskExecutionManager : PhoneAgentListener {
     }
 
     /**
-     * Cancels the currently running task.
+     * Cancels the whole session, including a running Agent round or repeat wait.
      */
     fun cancelTask() {
-        val componentManager = getComponentManager() ?: return
-        val agent = componentManager.phoneAgent ?: return
+        Logger.i(TAG, "Cancelling task session")
 
-        Logger.i(TAG, "Cancelling task")
-        agent.cancel()
+        getComponentManager()?.phoneAgent?.let { agent ->
+            if (agent.isRunning() || agent.isPaused()) {
+                agent.cancel()
+            }
+        }
+
+        synchronized(instructionStateLock) {
+            roundAcceptingInstructions = false
+            instructionQueue.clear()
+            updateInstructionCountsLocked()
+        }
+
         _taskState.value =
             _taskState.value.copy(
                 status = TaskStatus.FAILED,
-                resultMessage = "任务已取消",
+                resultMessage = CANCELLED_MESSAGE,
+                repeatRemainingSeconds = 0L,
+                nextRunAtMillis = null,
             )
+
+        sessionJob?.cancel()
     }
 
     /**
-     * Resets the task state to idle.
-     *
-     * Should be called when user wants to start a new task after completion/failure.
+     * Resets a completed/failed session back to idle.
      */
     fun resetTask() {
+        if (sessionJob?.isActive == true) {
+            Logger.w(TAG, "Cannot reset task state while a session is active")
+            return
+        }
+
         Logger.i(TAG, "Resetting task state")
+        synchronized(instructionStateLock) {
+            roundAcceptingInstructions = false
+            instructionQueue.clear()
+            _runtimeInstructions.value = emptyList()
+        }
         _taskState.value = TaskExecutionState()
         _steps.value = emptyList()
+        currentRoundNumber = 0
+        currentRepeatConfig = RepeatTaskConfig()
+    }
+
+    private fun clearRuntimeInstructionsForNewRound() {
+        synchronized(instructionStateLock) {
+            instructionQueue.clear()
+            _runtimeInstructions.value = emptyList()
+            roundAcceptingInstructions = true
+            updateInstructionCountsLocked()
+        }
     }
 
     // endregion
 
-    // region Query Methods
+    // region RuntimeInstructionSource
 
-    /**
-     * Enum representing reasons why a task cannot be started.
-     */
+    override fun consumeImmediateInstructions(applyAtStep: Int): List<RuntimeInstruction> {
+        val applied =
+            synchronized(instructionStateLock) {
+                val pending = instructionQueue.drainImmediateInstructions()
+                if (pending.isEmpty()) {
+                    return emptyList()
+                }
+
+                pending.map { instruction ->
+                    instruction.copy(
+                        status = RuntimeInstructionStatus.APPLIED,
+                        appliedAtStep = applyAtStep,
+                    )
+                }.also { updated ->
+                    updated.forEach { instruction ->
+                        replaceInstructionLocked(instruction)
+                        getHistoryManager()?.recordInstructionApplied(instruction)
+                    }
+                    updateInstructionCountsLocked()
+                }
+            }
+
+        return applied
+    }
+
+    override fun consumeNextStep(applyAtStep: Int): RuntimeInstruction? {
+        val executing =
+            synchronized(instructionStateLock) {
+                val pending = instructionQueue.pollNextStep() ?: return null
+                pending.copy(
+                    status = RuntimeInstructionStatus.EXECUTING,
+                    appliedAtStep = applyAtStep,
+                ).also { updated ->
+                    replaceInstructionLocked(updated)
+                    updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionApplied(updated)
+                }
+            }
+
+        return executing
+    }
+
+    override fun markNextStepCompleted(
+        instructionId: String,
+        completedAtStep: Int,
+    ) {
+        val completed =
+            synchronized(instructionStateLock) {
+                val current =
+                    _runtimeInstructions.value.firstOrNull { it.id == instructionId }
+                        ?: return
+
+                current.copy(
+                    status = RuntimeInstructionStatus.COMPLETED,
+                    completedAtStep = completedAtStep,
+                ).also { updated ->
+                    replaceInstructionLocked(updated)
+                    updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionCompleted(updated)
+                }
+            }
+    }
+
+    override fun resolveRoundFinish(applyAtStep: Int): RoundFinishResolution {
+        val resolution =
+            synchronized(instructionStateLock) {
+                val immediate = instructionQueue.drainImmediateInstructions()
+                if (immediate.isNotEmpty()) {
+                    val applied =
+                        immediate.map { instruction ->
+                            instruction.copy(
+                                status = RuntimeInstructionStatus.APPLIED,
+                                appliedAtStep = applyAtStep,
+                            )
+                        }
+                    applied.forEach { instruction ->
+                        replaceInstructionLocked(instruction)
+                        getHistoryManager()?.recordInstructionApplied(instruction)
+                    }
+                    updateInstructionCountsLocked()
+                    return@synchronized RoundFinishResolution.ApplyImmediate(applied)
+                }
+
+                val next = instructionQueue.pollNextStep()
+                if (next != null) {
+                    val executing =
+                        next.copy(
+                            status = RuntimeInstructionStatus.EXECUTING,
+                            appliedAtStep = applyAtStep,
+                        )
+                    replaceInstructionLocked(executing)
+                    updateInstructionCountsLocked()
+                    getHistoryManager()?.recordInstructionApplied(executing)
+                    return@synchronized RoundFinishResolution.ExecuteNext(executing)
+                }
+
+                // This transition is atomic with addRuntimeInstruction(), so an accepted instruction
+                // can never be lost between the final queue check and round completion.
+                roundAcceptingInstructions = false
+                RoundFinishResolution.Finish
+            }
+
+        return resolution
+    }
+
+    private fun replaceInstructionLocked(updated: RuntimeInstruction) {
+        _runtimeInstructions.value =
+            _runtimeInstructions.value.map { current ->
+                if (current.id == updated.id) updated else current
+            }
+    }
+
+    private fun updateInstructionCounts() {
+        synchronized(instructionStateLock) {
+            updateInstructionCountsLocked()
+        }
+    }
+
+    private fun updateInstructionCountsLocked() {
+        val instructions = _runtimeInstructions.value
+        val pendingImmediate =
+            instructions.count {
+                it.mode == RuntimeInstructionMode.CONTINUE_CURRENT &&
+                    it.status == RuntimeInstructionStatus.PENDING
+            }
+        val pendingNext =
+            instructions.count {
+                it.mode == RuntimeInstructionMode.NEXT_STEP &&
+                    it.status == RuntimeInstructionStatus.PENDING
+            }
+
+        _taskState.value =
+            _taskState.value.copy(
+                pendingInstructionCount = pendingImmediate,
+                queuedNextStepCount = pendingNext,
+            )
+    }
+
+    // endregion
+
+    // region Query methods
+
     enum class StartTaskBlockReason {
-        /** No blocking reason, task can be started. */
         NONE,
-
-        /** Shizuku service is not connected. */
         SERVICE_NOT_CONNECTED,
-
-        /** PhoneAgent is not available. */
         PHONE_AGENT_NULL,
-
-        /** A task is already running or paused. */
         TASK_ALREADY_RUNNING,
     }
 
-    /**
-     * Checks if a new task can be started.
-     *
-     * @return true if all preconditions are met to start a task
-     */
     fun canStartTask(): Boolean = getStartTaskBlockReason() == StartTaskBlockReason.NONE
 
-    /**
-     * Gets the specific reason why a task cannot be started.
-     *
-     * This method provides more detailed information than [canStartTask] for
-     * displaying appropriate error messages to the user.
-     *
-     * @return The blocking reason, or [StartTaskBlockReason.NONE] if task can be started
-     */
     fun getStartTaskBlockReason(): StartTaskBlockReason {
+        if (sessionJob?.isActive == true) {
+            Logger.d(TAG, "getStartTaskBlockReason: task session already active")
+            return StartTaskBlockReason.TASK_ALREADY_RUNNING
+        }
+
         val componentManager =
             getComponentManager()
                 ?: return StartTaskBlockReason.SERVICE_NOT_CONNECTED
 
-        // Check if service is connected
         if (!componentManager.isServiceConnected) {
             Logger.d(TAG, "getStartTaskBlockReason: service not connected")
             return StartTaskBlockReason.SERVICE_NOT_CONNECTED
         }
 
-        // Check if phone agent is available
         val agent = componentManager.phoneAgent
         if (agent == null) {
             Logger.d(TAG, "getStartTaskBlockReason: phoneAgent is null")
             return StartTaskBlockReason.PHONE_AGENT_NULL
         }
 
-        // Check if a task is already running
         if (agent.isRunning() || agent.isPaused()) {
             Logger.d(TAG, "getStartTaskBlockReason: task already running or paused")
             return StartTaskBlockReason.TASK_ALREADY_RUNNING
@@ -303,35 +653,27 @@ object TaskExecutionManager : PhoneAgentListener {
         return StartTaskBlockReason.NONE
     }
 
-    /**
-     * Checks if a task is currently running.
-     *
-     * @return true if a task is running or paused
-     */
     fun isTaskRunning(): Boolean {
         val status = _taskState.value.status
-        return status == TaskStatus.RUNNING || status == TaskStatus.PAUSED
+        return status == TaskStatus.RUNNING ||
+            status == TaskStatus.PAUSED ||
+            status == TaskStatus.WAITING_REPEAT
     }
 
     // endregion
 
-    // region PhoneAgentListener Implementation
+    // region PhoneAgentListener
 
-    /**
-     * Called when a new step starts in the task execution.
-     *
-     * @param stepNumber The step number that is starting
-     */
     override fun onStepStarted(stepNumber: Int) {
         Logger.d(TAG, "Step $stepNumber started")
         _taskState.value =
             _taskState.value.copy(
+                status = TaskStatus.RUNNING,
                 stepNumber = stepNumber,
                 thinking = "",
                 currentAction = "",
             )
 
-        // Add new step to the list
         val newStep =
             TaskStep(
                 stepNumber = stepNumber,
@@ -341,16 +683,10 @@ object TaskExecutionManager : PhoneAgentListener {
         _steps.value = _steps.value + newStep
     }
 
-    /**
-     * Called when the model's thinking text is updated.
-     *
-     * @param thinking The current thinking text from the model
-     */
     override fun onThinkingUpdate(thinking: String) {
         Logger.d(TAG, "Thinking update: ${thinking.take(50)}...")
         _taskState.value = _taskState.value.copy(thinking = thinking)
 
-        // Update the last step's thinking
         val currentSteps = _steps.value.toMutableList()
         if (currentSteps.isNotEmpty()) {
             val lastIndex = currentSteps.lastIndex
@@ -359,17 +695,11 @@ object TaskExecutionManager : PhoneAgentListener {
         }
     }
 
-    /**
-     * Called when an action is executed.
-     *
-     * @param action The action that was executed
-     */
     override fun onActionExecuted(action: AgentAction) {
         val actionText = action.formatForDisplay()
         Logger.d(TAG, "Action executed: $actionText")
         _taskState.value = _taskState.value.copy(currentAction = actionText)
 
-        // Update the last step's action
         val currentSteps = _steps.value.toMutableList()
         if (currentSteps.isNotEmpty()) {
             val lastIndex = currentSteps.lastIndex
@@ -378,93 +708,62 @@ object TaskExecutionManager : PhoneAgentListener {
         }
     }
 
-    /**
-     * Called when the task completes successfully.
-     *
-     * @param message The completion message
-     */
     override fun onTaskCompleted(message: String) {
+        if (sessionJob?.isActive == true) {
+            Logger.d(TAG, "Ignoring Agent completion callback; session orchestrator owns completion")
+            return
+        }
+
         Logger.i(TAG, "Task completed: $message")
         _taskState.value =
             _taskState.value.copy(
                 status = TaskStatus.COMPLETED,
                 resultMessage = message,
             )
-        // Notify FloatingWindowStateManager that task has ended
         FloatingWindowStateManager.onTaskCompleted()
     }
 
-    /**
-     * Called when the task fails.
-     *
-     * @param error The error message
-     */
     override fun onTaskFailed(error: String) {
+        if (sessionJob?.isActive == true) {
+            Logger.d(TAG, "Ignoring Agent failure callback; session orchestrator owns completion")
+            return
+        }
+
         Logger.e(TAG, "Task failed: $error")
         _taskState.value =
             _taskState.value.copy(
                 status = TaskStatus.FAILED,
                 resultMessage = error,
             )
-        // Notify FloatingWindowStateManager that task has ended
         FloatingWindowStateManager.onTaskCompleted()
     }
 
-    /**
-     * Called when screenshot capture starts.
-     */
     override fun onScreenshotStarted() {
-        // Can be used to show loading indicator if needed
         Logger.d(TAG, "Screenshot started")
     }
 
-    /**
-     * Called when screenshot capture completes.
-     */
     override fun onScreenshotCompleted() {
         Logger.d(TAG, "Screenshot completed")
     }
 
-    /**
-     * Called when the floating window needs to be refreshed.
-     */
     override fun onFloatingWindowRefreshNeeded() {
         Logger.d(TAG, "Floating window refresh needed")
-        // This will be handled by FloatingWindowService observing the state
     }
 
-    /**
-     * Called when task is paused.
-     *
-     * @param stepNumber The step number when paused
-     */
     override fun onTaskPaused(stepNumber: Int) {
         Logger.i(TAG, "Task paused at step $stepNumber")
         _taskState.value = _taskState.value.copy(status = TaskStatus.PAUSED)
     }
 
-    /**
-     * Called when task is resumed.
-     *
-     * @param stepNumber The step number when resumed
-     */
     override fun onTaskResumed(stepNumber: Int) {
-        Logger.i(TAG, "Task resumed at step $stepNumber")
+        Logger.i(TAG, "Task resumed from step $stepNumber")
         _taskState.value = _taskState.value.copy(status = TaskStatus.RUNNING)
     }
 
     // endregion
 
-    // region State Mapping Utilities
+    // region State mapping utilities
 
-    /**
-     * Maps AgentState to TaskStatus.
-     *
-     * Used for verifying state consistency between PhoneAgent and TaskExecutionManager.
-     *
-     * @param agentState The agent state to map
-     * @return Corresponding TaskStatus
-     */
     fun mapAgentStateToTaskStatus(agentState: AgentState): TaskStatus = when (agentState) {
         AgentState.IDLE -> TaskStatus.IDLE
         AgentState.RUNNING -> TaskStatus.RUNNING

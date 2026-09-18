@@ -181,6 +181,18 @@
             android:textSize="12sp"
             android:visibility="gone" />
 
+        <!-- Repeat countdown (shown between rounds) -->
+        <TextView
+            android:id="@+id/tv_repeat_countdown"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:background="@color/surface_variant"
+            android:paddingHorizontal="12dp"
+            android:paddingVertical="8dp"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp"
+            android:visibility="gone" />
+
         <!-- Control buttons container (shown when running/paused) -->
         <LinearLayout
             android:id="@+id/control_buttons_container"
@@ -250,6 +262,66 @@
                 app:iconGravity="textStart"
                 app:iconTint="@color/primary"
                 app:iconSize="16dp" />
+
+        </LinearLayout>
+
+        <!-- Runtime instruction input (shown while running/paused) -->
+        <LinearLayout
+            android:id="@+id/runtime_instruction_container"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingHorizontal="8dp"
+            android:paddingBottom="8dp"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <EditText
+                    android:id="@+id/runtime_instruction_input"
+                    android:layout_width="0dp"
+                    android:layout_height="40dp"
+                    android:layout_weight="1"
+                    android:background="@drawable/input_background"
+                    android:gravity="center_vertical|start"
+                    android:hint="@string/runtime_instruction_hint"
+                    android:inputType="textCapSentences|textMultiLine"
+                    android:maxLines="2"
+                    android:paddingHorizontal="10dp"
+                    android:textColor="@color/text_primary"
+                    android:textColorHint="@color/text_hint"
+                    android:textSize="12sp" />
+
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/btn_add_runtime_instruction"
+                    android:layout_width="wrap_content"
+                    android:layout_height="40dp"
+                    android:layout_marginStart="8dp"
+                    android:minWidth="56dp"
+                    android:text="@string/runtime_instruction_add"
+                    android:textColor="@color/on_primary"
+                    android:textSize="12sp"
+                    app:backgroundTint="@color/primary"
+                    app:cornerRadius="8dp"
+                    app:icon="@drawable/ic_plus"
+                    app:iconGravity="textStart"
+                    app:iconTint="@color/on_primary"
+                    app:iconSize="16dp" />
+
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/tv_runtime_instruction_summary"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp"
+                android:visibility="gone" />
 
         </LinearLayout>
 

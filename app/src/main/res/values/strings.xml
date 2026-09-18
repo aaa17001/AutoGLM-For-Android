@@ -51,12 +51,39 @@
     <string name="task_input_hint">描述你想要执行的任务...</string>
     <string name="start_task">启动</string>
     <string name="cancel_task">停止</string>
+    <string name="repeat_task_title">循环执行</string>
+    <string name="repeat_task_enable">开启循环执行</string>
+    <string name="repeat_disabled">循环关闭</string>
+    <string name="repeat_enabled_format">循环 %1$d~%2$d 分钟</string>
+    <string name="repeat_min_minutes">最短间隔（分钟）</string>
+    <string name="repeat_max_minutes">最长间隔（分钟）</string>
+    <string name="repeat_random_hint_default">每轮完成后将在设置范围内随机等待，随机精确到秒</string>
+    <string name="repeat_random_hint_format">实际每轮将在 %1$d~%2$d 秒之间随机等待</string>
+    <string name="repeat_validation_number">请输入有效的整数</string>
+    <string name="repeat_validation_min">最短间隔必须大于 0</string>
+    <string name="repeat_validation_range">最长间隔不能小于最短间隔</string>
+    <string name="repeat_seconds_format">%1$d秒</string>
+    <string name="repeat_minutes_seconds_format">%1$d分%2$d秒</string>
+    <string name="repeat_countdown_format">第 %1$d 轮已完成，%3$s 后开始第 %2$d 轮</string>
+
+    <string name="runtime_instruction_hint">输入执行中的追加要求…</string>
+    <string name="runtime_instruction_add">添加</string>
+    <string name="runtime_instruction_empty">请输入追加要求</string>
+    <string name="runtime_instruction_continue">继续当前任务</string>
+    <string name="runtime_instruction_next_step">添加为下一步</string>
+    <string name="runtime_instruction_added">已添加执行要求</string>
+    <string name="runtime_instruction_unavailable">当前状态不能添加执行要求</string>
+    <string name="runtime_instruction_continue_short">当前</string>
+    <string name="runtime_instruction_next_step_short">下一步</string>
+    <string name="runtime_instruction_pending_format">待处理 %1$d 项</string>
+    <string name="runtime_instruction_more_format">…另有 %1$d 项</string>
     
     <!-- Task Status -->
     <string name="task_status_label">状态</string>
     <string name="task_status_idle">空闲</string>
     <string name="task_status_running">执行中</string>
     <string name="task_status_paused">已暂停</string>
+    <string name="task_status_waiting_repeat">等待下一轮</string>
     <string name="task_status_completed">已完成</string>
     <string name="task_status_failed">失败</string>
     <string name="task_status_cancelled">已取消</string>
@@ -237,6 +264,24 @@
     <string name="history_save_failed">保存失败</string>
     <string name="history_copy_prompt">复制提示词</string>
     <string name="history_prompt_copied">提示词已复制到剪贴板</string>
+    <string name="history_info_extended_format">%1$s · %2$d轮 · %3$d步 · 追加%4$d次 · %5$s</string>
+    <string name="history_round_format">第 %1$d 轮</string>
+    <string name="history_instruction_continue">用户追加 · 继续当前任务</string>
+    <string name="history_instruction_next_step">用户追加 · 下一步</string>
+    <string name="history_added_at_step">添加于 Step %1$d</string>
+    <string name="history_applied_at_step">生效于 Step %1$d</string>
+    <string name="history_completed_at_step">完成于 Step %1$d</string>
+    <string name="history_round_completed_format">第 %1$d 轮完成</string>
+    <string name="history_repeat_wait">下一轮等待</string>
+    <string name="history_repeat_wait_detail_format">随机等待 %1$d 秒（%2$s）</string>
+    <string name="history_export_title">导出完整记录</string>
+    <string name="history_export_markdown">Markdown（便于人和 AI 阅读）</string>
+    <string name="history_export_json">JSON（完整结构化数据）</string>
+    <string name="history_export_zip">完整 ZIP（记录 + 全部截图）</string>
+    <string name="history_export_generating">正在生成完整任务记录…</string>
+    <string name="history_export_ready">任务记录已生成</string>
+    <string name="history_export_failed">导出任务记录失败</string>
+    <string name="history_export_share_title">导出 AutoGLM 任务记录</string>
     <string name="history_load_more">加载更多</string>
     <string name="history_load_more_count">加载更多 (剩余 %d 步)</string>
     

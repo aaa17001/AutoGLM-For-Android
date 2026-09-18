@@ -3,6 +3,7 @@ package com.kevinluo.autoglm.ui
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.kevinluo.autoglm.task.RepeatTaskConfig
 import com.kevinluo.autoglm.task.TaskExecutionManager
 import com.kevinluo.autoglm.util.Logger
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -191,7 +192,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 val isRunning =
                     taskState.status == TaskStatus.RUNNING ||
-                        taskState.status == TaskStatus.PAUSED
+                        taskState.status == TaskStatus.PAUSED ||
+                        taskState.status == TaskStatus.WAITING_REPEAT
 
                 _uiState.value =
                     _uiState.value.copy(
@@ -348,7 +350,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * @param taskDescription The description of the task to execute
      *
      */
-    fun startTask(taskDescription: String) {
+    fun startTask(
+        taskDescription: String,
+        repeatConfig: RepeatTaskConfig = RepeatTaskConfig(),
+    ) {
         if (!TaskExecutionManager.canStartTask()) {
             appendLog("Error: Cannot start task - preconditions not met")
             Logger.w(TAG, "Cannot start task: preconditions not met")
@@ -362,16 +367,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Logger.d(TAG, "Starting task: ${taskDescription.take(50)}...")
         appendLog("Starting task: $taskDescription")
 
-        // Notify state manager that task is starting
-        FloatingWindowStateManager.onTaskStarted(getApplication())
-
         viewModelScope.launch {
             // Minimize app
             _events.emit(MainUiEvent.MinimizeApp)
         }
 
-        // Start task via TaskExecutionManager
-        TaskExecutionManager.startTask(taskDescription)
+        // TaskExecutionManager owns the complete session lifecycle.
+        TaskExecutionManager.startTask(
+            description = taskDescription,
+            repeatConfig = repeatConfig,
+        )
     }
 
     /**
@@ -382,8 +387,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Logger.d(TAG, "Cancelling task")
         TaskExecutionManager.cancelTask()
         appendLog("Task cancelled by user")
-        // Notify state manager that task completed
-        FloatingWindowStateManager.onTaskCompleted()
     }
 
     /**
