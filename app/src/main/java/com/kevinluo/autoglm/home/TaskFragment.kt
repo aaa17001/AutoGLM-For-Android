@@ -292,8 +292,8 @@ class TaskFragment : Fragment() {
                 rangeHint.text =
                     getString(
                         R.string.repeat_random_hint_format,
-                        minMinutes * 60,
-                        maxMinutes * 60,
+                        minMinutes.toLong() * 60L,
+                        maxMinutes.toLong() * 60L,
                     )
             } else {
                 rangeHint.setText(R.string.repeat_random_hint_default)
