@@ -104,7 +104,7 @@ class HistoryDetailAdapter(
     override fun onViewRecycled(holder: RecyclerView.ViewHolder) {
         super.onViewRecycled(holder)
         if (holder is StepViewHolder) {
-            val position = holder.bindingAdapterPosition
+            val position = holder.adapterPosition
             if (position != RecyclerView.NO_POSITION) {
                 loadingJobs[position]?.cancel()
                 loadingJobs.remove(position)
@@ -329,7 +329,7 @@ class HistoryDetailAdapter(
                 }
             }
 
-            val position = bindingAdapterPosition
+            val position = adapterPosition
             if (position != RecyclerView.NO_POSITION) {
                 loadingJobs[position]?.cancel()
                 loadingJobs[position] =
