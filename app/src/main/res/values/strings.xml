@@ -57,6 +57,7 @@
     <string name="task_status_idle">空闲</string>
     <string name="task_status_running">执行中</string>
     <string name="task_status_paused">已暂停</string>
+    <string name="task_status_waiting_repeat">等待下一轮</string>
     <string name="task_status_completed">已完成</string>
     <string name="task_status_failed">失败</string>
     <string name="task_status_cancelled">已取消</string>

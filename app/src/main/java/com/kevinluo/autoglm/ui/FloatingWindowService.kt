@@ -55,6 +55,9 @@ enum class TaskStatus {
     /** Task execution has been paused by the user. */
     PAUSED,
 
+    /** Waiting for the randomized delay before the next repeat round. */
+    WAITING_REPEAT,
+
     /** Task has completed successfully. */
     COMPLETED,
 
@@ -209,6 +212,7 @@ class FloatingWindowService :
                     TaskStatus.IDLE -> R.string.task_status_idle to R.color.status_idle
                     TaskStatus.RUNNING -> R.string.task_status_running to R.color.status_running
                     TaskStatus.PAUSED -> R.string.task_status_paused to R.color.status_paused
+                    TaskStatus.WAITING_REPEAT -> R.string.task_status_waiting_repeat to R.color.status_waiting
                     TaskStatus.COMPLETED -> R.string.task_status_completed to R.color.status_completed
                     TaskStatus.FAILED -> R.string.task_status_failed to R.color.status_failed
                     TaskStatus.WAITING_CONFIRMATION -> R.string.floating_waiting_confirm to R.color.status_waiting
@@ -486,6 +490,7 @@ class FloatingWindowService :
                         TaskStatus.IDLE -> R.string.task_status_idle to R.color.status_idle
                         TaskStatus.RUNNING -> R.string.task_status_running to R.color.status_running
                         TaskStatus.PAUSED -> R.string.task_status_paused to R.color.status_paused
+                        TaskStatus.WAITING_REPEAT -> R.string.task_status_waiting_repeat to R.color.status_waiting
                         TaskStatus.COMPLETED -> R.string.task_status_completed to R.color.status_completed
                         TaskStatus.FAILED -> R.string.task_status_failed to R.color.status_failed
                         TaskStatus.WAITING_CONFIRMATION -> R.string.floating_waiting_confirm to R.color.status_waiting
@@ -678,6 +683,18 @@ class FloatingWindowService :
                     controlButtonsContainer?.visibility = View.VISIBLE
                     pauseBtn?.visibility = View.GONE
                     resumeBtn?.visibility = View.VISIBLE
+                    stopBtn?.visibility = View.VISIBLE
+                    newTaskBtn?.visibility = View.GONE
+                }
+
+                TaskStatus.WAITING_REPEAT -> {
+                    // Keep the last round visible and allow the user to stop the repeat session.
+                    Logger.d(TAG, "updateUIForStatus: Waiting for next repeat round")
+                    inputArea?.visibility = View.GONE
+                    stepsRecycler?.visibility = View.VISIBLE
+                    controlButtonsContainer?.visibility = View.VISIBLE
+                    pauseBtn?.visibility = View.GONE
+                    resumeBtn?.visibility = View.GONE
                     stopBtn?.visibility = View.VISIBLE
                     newTaskBtn?.visibility = View.GONE
                 }
