@@ -62,6 +62,21 @@
     <string name="repeat_validation_number">请输入有效的整数</string>
     <string name="repeat_validation_min">最短间隔必须大于 0</string>
     <string name="repeat_validation_range">最长间隔不能小于最短间隔</string>
+    <string name="repeat_seconds_format">%1$d秒</string>
+    <string name="repeat_minutes_seconds_format">%1$d分%2$d秒</string>
+    <string name="repeat_countdown_format">第 %1$d 轮已完成，%3$s 后开始第 %2$d 轮</string>
+
+    <string name="runtime_instruction_hint">输入执行中的追加要求…</string>
+    <string name="runtime_instruction_add">添加</string>
+    <string name="runtime_instruction_empty">请输入追加要求</string>
+    <string name="runtime_instruction_continue">继续当前任务</string>
+    <string name="runtime_instruction_next_step">添加为下一步</string>
+    <string name="runtime_instruction_added">已添加执行要求</string>
+    <string name="runtime_instruction_unavailable">当前状态不能添加执行要求</string>
+    <string name="runtime_instruction_continue_short">当前</string>
+    <string name="runtime_instruction_next_step_short">下一步</string>
+    <string name="runtime_instruction_pending_format">待处理 %1$d 项</string>
+    <string name="runtime_instruction_more_format">…另有 %1$d 项</string>
     
     <!-- Task Status -->
     <string name="task_status_label">状态</string>
