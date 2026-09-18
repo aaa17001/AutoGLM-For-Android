@@ -55,6 +55,8 @@ object TaskExecutionManager :
     val steps: StateFlow<List<TaskStep>> = _steps.asStateFlow()
 
     private val instructionQueue = RuntimeInstructionQueue()
+    private val instructionStateLock = Any()
+    private var roundAcceptingInstructions = false
     private val _runtimeInstructions = MutableStateFlow<List<RuntimeInstruction>>(emptyList())
 
     /** Runtime instructions for the current round, including completed items until the round ends. */
@@ -288,8 +290,11 @@ object TaskExecutionManager :
                 )
             }
 
-            instructionQueue.clear()
-            _runtimeInstructions.value = emptyList()
+            synchronized(instructionStateLock) {
+                roundAcceptingInstructions = false
+                instructionQueue.clear()
+                _runtimeInstructions.value = emptyList()
+            }
             FloatingWindowStateManager.onTaskCompleted()
 
             currentRepeatConfig = RepeatTaskConfig()
@@ -339,24 +344,33 @@ object TaskExecutionManager :
         val normalized = content.trim()
         if (normalized.isEmpty()) return false
 
-        val status = _taskState.value.status
-        if (status != TaskStatus.RUNNING && status != TaskStatus.PAUSED) {
-            Logger.w(TAG, "Runtime instruction rejected in state $status")
-            return false
-        }
-
         val instruction =
-            RuntimeInstruction(
-                content = normalized,
-                mode = mode,
-                roundNumber = currentRoundNumber.coerceAtLeast(1),
-                addedAtStep = _taskState.value.stepNumber,
-            )
+            synchronized(instructionStateLock) {
+                val status = _taskState.value.status
+                if (
+                    !roundAcceptingInstructions ||
+                    (status != TaskStatus.RUNNING && status != TaskStatus.PAUSED)
+                ) {
+                    Logger.w(
+                        TAG,
+                        "Runtime instruction rejected: accepting=$roundAcceptingInstructions, state=$status",
+                    )
+                    return false
+                }
 
-        instructionQueue.add(instruction)
-        _runtimeInstructions.value = _runtimeInstructions.value + instruction
+                RuntimeInstruction(
+                    content = normalized,
+                    mode = mode,
+                    roundNumber = currentRoundNumber.coerceAtLeast(1),
+                    addedAtStep = _taskState.value.stepNumber,
+                ).also { queued ->
+                    instructionQueue.add(queued)
+                    _runtimeInstructions.value = _runtimeInstructions.value + queued
+                    updateInstructionCountsLocked()
+                }
+            }
+
         getHistoryManager()?.recordInstructionAdded(instruction)
-        updateInstructionCounts()
 
         Logger.i(
             TAG,
@@ -409,8 +423,11 @@ object TaskExecutionManager :
             }
         }
 
-        instructionQueue.clear()
-        updateInstructionCounts()
+        synchronized(instructionStateLock) {
+            roundAcceptingInstructions = false
+            instructionQueue.clear()
+            updateInstructionCountsLocked()
+        }
 
         _taskState.value =
             _taskState.value.copy(
@@ -433,8 +450,11 @@ object TaskExecutionManager :
         }
 
         Logger.i(TAG, "Resetting task state")
-        instructionQueue.clear()
-        _runtimeInstructions.value = emptyList()
+        synchronized(instructionStateLock) {
+            roundAcceptingInstructions = false
+            instructionQueue.clear()
+            _runtimeInstructions.value = emptyList()
+        }
         _taskState.value = TaskExecutionState()
         _steps.value = emptyList()
         currentRoundNumber = 0
@@ -442,9 +462,12 @@ object TaskExecutionManager :
     }
 
     private fun clearRuntimeInstructionsForNewRound() {
-        instructionQueue.clear()
-        _runtimeInstructions.value = emptyList()
-        updateInstructionCounts()
+        synchronized(instructionStateLock) {
+            instructionQueue.clear()
+            _runtimeInstructions.value = emptyList()
+            roundAcceptingInstructions = true
+            updateInstructionCountsLocked()
+        }
     }
 
     // endregion
@@ -452,36 +475,44 @@ object TaskExecutionManager :
     // region RuntimeInstructionSource
 
     override fun consumeImmediateInstructions(applyAtStep: Int): List<RuntimeInstruction> {
-        val pending = instructionQueue.drainImmediateInstructions()
-        if (pending.isEmpty()) return emptyList()
-
         val applied =
-            pending.map { instruction ->
-                instruction.copy(
-                    status = RuntimeInstructionStatus.APPLIED,
-                    appliedAtStep = applyAtStep,
-                )
+            synchronized(instructionStateLock) {
+                val pending = instructionQueue.drainImmediateInstructions()
+                if (pending.isEmpty()) {
+                    return emptyList()
+                }
+
+                pending.map { instruction ->
+                    instruction.copy(
+                        status = RuntimeInstructionStatus.APPLIED,
+                        appliedAtStep = applyAtStep,
+                    )
+                }.also { updated ->
+                    updated.forEach(::replaceInstructionLocked)
+                    updateInstructionCountsLocked()
+                }
             }
 
         applied.forEach { instruction ->
-            replaceInstruction(instruction)
             getHistoryManager()?.recordInstructionApplied(instruction)
         }
-        updateInstructionCounts()
         return applied
     }
 
     override fun consumeNextStep(applyAtStep: Int): RuntimeInstruction? {
-        val pending = instructionQueue.pollNextStep() ?: return null
         val executing =
-            pending.copy(
-                status = RuntimeInstructionStatus.EXECUTING,
-                appliedAtStep = applyAtStep,
-            )
+            synchronized(instructionStateLock) {
+                val pending = instructionQueue.pollNextStep() ?: return null
+                pending.copy(
+                    status = RuntimeInstructionStatus.EXECUTING,
+                    appliedAtStep = applyAtStep,
+                ).also { updated ->
+                    replaceInstructionLocked(updated)
+                    updateInstructionCountsLocked()
+                }
+            }
 
-        replaceInstruction(executing)
         getHistoryManager()?.recordInstructionApplied(executing)
-        updateInstructionCounts()
         return executing
     }
 
@@ -489,22 +520,75 @@ object TaskExecutionManager :
         instructionId: String,
         completedAtStep: Int,
     ) {
-        val current =
-            _runtimeInstructions.value.firstOrNull { it.id == instructionId }
-                ?: return
-
         val completed =
-            current.copy(
-                status = RuntimeInstructionStatus.COMPLETED,
-                completedAtStep = completedAtStep,
-            )
+            synchronized(instructionStateLock) {
+                val current =
+                    _runtimeInstructions.value.firstOrNull { it.id == instructionId }
+                        ?: return
 
-        replaceInstruction(completed)
+                current.copy(
+                    status = RuntimeInstructionStatus.COMPLETED,
+                    completedAtStep = completedAtStep,
+                ).also { updated ->
+                    replaceInstructionLocked(updated)
+                    updateInstructionCountsLocked()
+                }
+            }
+
         getHistoryManager()?.recordInstructionCompleted(completed)
-        updateInstructionCounts()
     }
 
-    private fun replaceInstruction(updated: RuntimeInstruction) {
+    override fun resolveRoundFinish(applyAtStep: Int): RoundFinishResolution {
+        val resolution =
+            synchronized(instructionStateLock) {
+                val immediate = instructionQueue.drainImmediateInstructions()
+                if (immediate.isNotEmpty()) {
+                    val applied =
+                        immediate.map { instruction ->
+                            instruction.copy(
+                                status = RuntimeInstructionStatus.APPLIED,
+                                appliedAtStep = applyAtStep,
+                            )
+                        }
+                    applied.forEach(::replaceInstructionLocked)
+                    updateInstructionCountsLocked()
+                    return@synchronized RoundFinishResolution.ApplyImmediate(applied)
+                }
+
+                val next = instructionQueue.pollNextStep()
+                if (next != null) {
+                    val executing =
+                        next.copy(
+                            status = RuntimeInstructionStatus.EXECUTING,
+                            appliedAtStep = applyAtStep,
+                        )
+                    replaceInstructionLocked(executing)
+                    updateInstructionCountsLocked()
+                    return@synchronized RoundFinishResolution.ExecuteNext(executing)
+                }
+
+                // This transition is atomic with addRuntimeInstruction(), so an accepted instruction
+                // can never be lost between the final queue check and round completion.
+                roundAcceptingInstructions = false
+                RoundFinishResolution.Finish
+            }
+
+        when (resolution) {
+            is RoundFinishResolution.ApplyImmediate ->
+                resolution.instructions.forEach { instruction ->
+                    getHistoryManager()?.recordInstructionApplied(instruction)
+                }
+
+            is RoundFinishResolution.ExecuteNext ->
+                getHistoryManager()?.recordInstructionApplied(resolution.instruction)
+
+            RoundFinishResolution.Finish -> Unit
+        }
+
+        return resolution
+    }
+
+    private fun replaceInstructionLocked(updated: RuntimeInstruction) {
         _runtimeInstructions.value =
             _runtimeInstructions.value.map { current ->
                 if (current.id == updated.id) updated else current
@@ -512,6 +596,12 @@ object TaskExecutionManager :
     }
 
     private fun updateInstructionCounts() {
+        synchronized(instructionStateLock) {
+            updateInstructionCountsLocked()
+        }
+    }
+
+    private fun updateInstructionCountsLocked() {
         val instructions = _runtimeInstructions.value
         val pendingImmediate =
             instructions.count {

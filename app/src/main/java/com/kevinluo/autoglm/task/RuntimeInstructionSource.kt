@@ -1,5 +1,17 @@
 package com.kevinluo.autoglm.task
 
+sealed class RoundFinishResolution {
+    data class ApplyImmediate(
+        val instructions: List<RuntimeInstruction>,
+    ) : RoundFinishResolution()
+
+    data class ExecuteNext(
+        val instruction: RuntimeInstruction,
+    ) : RoundFinishResolution()
+
+    data object Finish : RoundFinishResolution()
+}
+
 /**
  * Boundary between [com.kevinluo.autoglm.agent.PhoneAgent] and task-session orchestration.
  *
@@ -24,4 +36,12 @@ interface RuntimeInstructionSource {
         instructionId: String,
         completedAtStep: Int,
     )
+
+    /**
+     * Atomically resolves a stage Finish against instructions that may be added concurrently.
+     *
+     * If no instruction was accepted before this call, the round is closed for further input and
+     * [RoundFinishResolution.Finish] is returned. Any later UI submission must be rejected.
+     */
+    fun resolveRoundFinish(applyAtStep: Int): RoundFinishResolution
 }

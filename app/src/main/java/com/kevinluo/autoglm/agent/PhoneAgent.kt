@@ -12,6 +12,7 @@ import com.kevinluo.autoglm.model.ModelResult
 import com.kevinluo.autoglm.screenshot.ScreenshotService
 import com.kevinluo.autoglm.task.RuntimeInstruction
 import com.kevinluo.autoglm.task.RuntimeInstructionSource
+import com.kevinluo.autoglm.task.RoundFinishResolution
 import com.kevinluo.autoglm.util.ErrorHandler
 import com.kevinluo.autoglm.util.Logger
 import kotlinx.coroutines.CancellationException
@@ -400,27 +401,9 @@ class PhoneAgent(
                 }
 
                 if (stepResult.finished) {
-                    // If a user added a CONTINUE_CURRENT instruction while this finishing step was
-                    // executing, reopen the current stage before advancing to queued NEXT_STEP work.
-                    val lateImmediateInstructions =
-                        instructionSource
-                            ?.consumeImmediateInstructions(currentStepNumber + 1)
-                            .orEmpty()
-
-                    if (lateImmediateInstructions.isNotEmpty()) {
-                        pendingRuntimeDirective =
-                            buildImmediateInstructionDirective(lateImmediateInstructions)
-                        nextStepHint = null
-                        lastMessage = stepResult.message ?: "Task stage completed"
-                        Logger.i(
-                            TAG,
-                            "Finish deferred: applying ${lateImmediateInstructions.size} runtime instruction(s)",
-                        )
-                        continue
-                    }
-
-                    // A queued follow-up stage is complete only after it reaches Finish with no
-                    // newer CONTINUE_CURRENT correction waiting.
+                    // A queued follow-up stage is complete when its Finish is reached. Any
+                    // instruction accepted concurrently with this Finish is resolved atomically
+                    // below before the round is allowed to close.
                     activeQueuedInstruction?.let { instruction ->
                         instructionSource?.markNextStepCompleted(
                             instructionId = instruction.id,
@@ -429,21 +412,40 @@ class PhoneAgent(
                         activeQueuedInstruction = null
                     }
 
-                    val nextQueuedInstruction =
-                        instructionSource?.consumeNextStep(currentStepNumber + 1)
+                    if (instructionSource != null) {
+                        when (
+                            val resolution =
+                                instructionSource.resolveRoundFinish(currentStepNumber + 1)
+                        ) {
+                            is RoundFinishResolution.ApplyImmediate -> {
+                                pendingRuntimeDirective =
+                                    buildImmediateInstructionDirective(resolution.instructions)
+                                nextStepHint = null
+                                lastMessage = stepResult.message ?: "Task stage completed"
+                                Logger.i(
+                                    TAG,
+                                    "Finish deferred: applying " +
+                                        "${resolution.instructions.size} runtime instruction(s)",
+                                )
+                                continue
+                            }
 
-                    if (nextQueuedInstruction != null) {
-                        activeQueuedInstruction = nextQueuedInstruction
-                        pendingRuntimeDirective =
-                            buildNextStepInstructionDirective(nextQueuedInstruction)
-                        nextStepHint = null
-                        lastMessage = stepResult.message ?: "Task stage completed"
-                        Logger.i(
-                            TAG,
-                            "Continuing with queued next-step instruction: " +
-                                nextQueuedInstruction.content.take(80),
-                        )
-                        continue
+                            is RoundFinishResolution.ExecuteNext -> {
+                                activeQueuedInstruction = resolution.instruction
+                                pendingRuntimeDirective =
+                                    buildNextStepInstructionDirective(resolution.instruction)
+                                nextStepHint = null
+                                lastMessage = stepResult.message ?: "Task stage completed"
+                                Logger.i(
+                                    TAG,
+                                    "Continuing with queued next-step instruction: " +
+                                        resolution.instruction.content.take(80),
+                                )
+                                continue
+                            }
+
+                            RoundFinishResolution.Finish -> Unit
+                        }
                     }
 
                     lastMessage = stepResult.message ?: "Task completed"
